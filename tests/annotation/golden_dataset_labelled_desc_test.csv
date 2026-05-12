@@ -1,0 +1,11 @@
+keyword,product_id,retailer,description,sonus_graded_relevance,sonus_reason,sonus_reason_other_text,sonus_attribute,sonus_attribute_other_text,sonus_qa_done,sonus_timestamp,lisha_graded_relevance,lisha_reason,lisha_reason_other_text,lisha_attribute,lisha_attribute_other_text,lisha_qa_done,lisha_timestamp
+running shoes,pid_001,gap,Classic running shoe,2,,,,,TRUE,2024-01-01T10:00:00.000Z,,,,,,,
+running shoes,pid_002,gap,Trail runner,1,,,,,TRUE,2024-01-01T10:01:00.000Z,2,,,,,TRUE,2024-01-02T09:00:00.000Z
+running shoes,pid_003,gap,Dress shoe,0,wrong_product_category,,,,TRUE,2024-01-01T10:02:00.000Z,0,wrong_product_category,,,,TRUE,2024-01-02T09:01:00.000Z
+blue jeans,pid_004,gap,Slim fit jeans,,,,,,,,,,,,,,
+blue jeans,pid_005,gap,Bootcut jeans,,,,,,,,,,,,,,
+denim jacket,pid_006,oldnavy,Classic denim jacket,,,,,,,,,,,,,,
+denim jacket,pid_007,oldnavy,Fleece jacket,0,wrong_product_category,,,,TRUE,2024-01-01T11:00:00.000Z,,,,,,,
+t-shirt,pid_008,oldnavy,Basic tee,,,,,,,,,,,,,,
+t-shirt,pid_009,oldnavy,Graphic tee,,,,,,,,1,,,,,,
+

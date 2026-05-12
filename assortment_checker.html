@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QA Assortment Checker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<!-- SheetJS for reading new_iteration.xlsx directly from the browser -->
+<script src="vendor/xlsx.full.min.js"></script>
+<!-- Annotation mode modules (loaded before app.js) -->
+<script src="annotation/data.js"></script>
+<script src="annotation/csv.js"></script>
+<script src="annotation/render.js"></script>
+<script src="annotation/bulk.js"></script>
+<!-- Auto-save module (must load before app.js so scheduleAutoSave is defined) -->
+<script src="autosave.js"></script>
+</head>
+<body>
+<!-- LOADING OVERLAY -->
+<div id="loadingOverlay" class="loading-overlay">
+  <div class="loading-spinner"></div>
+  <p id="loadingMsg">Loading data…</p>
+</div>
+
+<!-- HEADER -->
+<header class="topbar">
+  <div class="topbar-left">
+    <h1>🔍 Assortment Checker</h1>
+  </div>
+  <div class="topbar-center" id="metricsBar">
+    <div class="metric-pill" id="metricTotal"><span class="metric-label">Total</span><span class="metric-value" id="valTotal">0</span></div>
+    <div class="metric-pill good" id="metricApproved"><span class="metric-label">Approved</span><span class="metric-value" id="valApproved">0</span></div>
+    <div class="metric-pill bad" id="metricDisapproved"><span class="metric-label">Disapproved</span><span class="metric-value" id="valDisapproved">0</span></div>
+    <div class="metric-pill" id="metricHitRate"><span class="metric-label">Hit Rate</span><span class="metric-value" id="valHitRate">—</span></div>
+  </div>
+  <!-- Annotation mode metrics (hidden in iteration mode) -->
+  <div class="topbar-center" id="annotationMetricsBar" style="display:none">
+    <div class="metric-pill" id="metricAnnTotal"><span class="metric-label">Total</span><span class="metric-value" id="valAnnTotal">0</span></div>
+    <div class="metric-pill metric-grade-0" id="metricGrade0"><span class="metric-label">Grade 0</span><span class="metric-value" id="valGrade0">0</span></div>
+    <div class="metric-pill metric-grade-1" id="metricGrade1"><span class="metric-label">Grade 1</span><span class="metric-value" id="valGrade1">0</span></div>
+    <div class="metric-pill metric-grade-2" id="metricGrade2"><span class="metric-label">Grade 2</span><span class="metric-value" id="valGrade2">0</span></div>
+    <div class="metric-pill" id="metricLabeledPct"><span class="metric-label">Labeled %</span><span class="metric-value" id="valLabeledPct">—</span></div>
+  </div>
+  <div class="topbar-right">
+    <div class="user-selector">
+      <label class="user-label">Iteration:</label>
+      <span id="iterationDisplay" class="iteration-badge" title="No iteration hash — load new_iteration.xlsx to set">—</span>
+    </div>
+    <!-- Annotation mode: retailer picker (hidden in iteration mode) -->
+    <div class="user-selector" id="retailerSelectorWrap" style="display:none">
+      <label class="user-label">Retailer:</label>
+      <select id="retailerSelect" class="filter-select" onchange="handleRetailerChange()">
+        <option value="">Select retailer…</option>
+      </select>
+    </div>
+    <div class="user-selector">
+      <label class="user-label">User:</label>
+      <select id="userSelect" class="filter-select" onchange="handleUserChange()">
+        <option value="">Select user…</option>
+        <option value="Sonus">Sonus</option>
+        <option value="Lisha">Lisha</option>
+        <option value="Shweta">Shweta</option>
+      </select>
+    </div>
+    <button class="btn btn-outline" onclick="exportDisapprovals()">📥 Export CSV</button>
+    <button class="btn btn-outline btn-save" onclick="flushAutoSave(); saveMetaData()" title="Save QA session to JSON now (auto-save also runs in the background ~600ms after every change)">💾 Save</button>
+    <span id="autoSaveStatus" class="autosave-status" data-status="idle" title="Auto-save status"></span>
+    <button class="btn btn-outline" onclick="importDisapprovals()">📤 Import</button>
+    <button class="btn btn-merge" onclick="openMergePanel()" title="Merge two output folders">🔀 Merge</button>
+  </div>
+</header>
+
+<!-- MAIN LAYOUT -->
+<div class="main-layout">
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <input type="text" class="search-input" id="kwSearch" placeholder="Search keywords…" oninput="filterKeywords()">
+    </div>
+    <div class="keyword-list" id="keywordList"></div>
+    <!-- Retailer QA progress (annotation mode only) -->
+    <div id="retailerProgressWrap" class="retailer-progress-wrap" style="display:none">
+      <div class="retailer-progress-track">
+        <div class="retailer-progress-fill" id="retailerProgressFill" style="width:0%"></div>
+      </div>
+      <span class="retailer-progress-label" id="retailerProgressLabel">0% reviewed</span>
+    </div>
+    <div class="sidebar-footer">
+      <div class="data-loader">
+        <button class="btn btn-sm btn-primary" onclick="openClientFolder()">📂 Load Data Folder</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- CONTENT -->
+  <main class="content">
+    <!-- TOOLBAR -->
+    <div class="toolbar" id="toolbar">
+      <!-- Row 1: Filters -->
+      <div class="filter-row" id="filterRow">
+        <div class="filter-group">
+          <select id="filterField" class="filter-select" onchange="populateFilterValues()" title="Filter by">
+            <option value="product_dump">Product Dump</option>
+            <option value="title">Title</option>
+            <option value="description">Description</option>
+            <option disabled>──────────</option>
+            <option value="brand">Brand</option>
+            <option value="color">Color</option>
+            <option value="product_type">Product Type</option>
+            <option value="material">Material</option>
+            <option value="occasion">Occasion</option>
+            <option disabled>──────────</option>
+            <option value="label">Label</option>
+            <option value="grade">Grade (annotation)</option>
+          </select>
+          <select id="filterOperator" class="filter-select" onchange="applyFilter()" title="Match operator">
+            <option value="contains">contains</option>
+            <option value="not_contains">does not contain</option>
+          </select>
+          <div id="filterValueWrap" style="display:contents">
+            <input  type="text" id="filterValueText"   class="filter-text-input" placeholder="Search product dump…" oninput="onFilterValueInput()" style="width:200px">
+            <select id="filterValueSelect" class="filter-select" onchange="applyFilter()" style="display:none">
+              <option value="">Select value…</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn btn-sm btn-ghost clear-btn" onclick="clearFilter()" title="Clear all active filters">✕ Clear</button>
+        <span id="activeFiltersChip" class="active-filters-chip" style="display:none"></span>
+        <div class="toolbar-spacer"></div>
+        <span id="gridProductCount" class="grid-count-chip" style="display:none"></span>
+        <button id="showLabelsBtn" class="btn btn-sm toggle-pill" onclick="toggleShowLabels()" title="Show products already labeled in the current review set">👁 Show Labeled</button>
+        <button id="showPriorBtn" class="btn btn-sm toggle-pill" onclick="toggleShowPrior()" title="Show products labeled in prior iterations that are not in the current review set">🕑 Prior Iterations</button>
+      </div>
+      <!-- Active filter pills row -->
+      <div class="filter-pills-row" id="filterPillsRow" style="display:none"></div>
+      <!-- Row 2: Bulk actions — iteration mode -->
+      <div class="bulk-row" id="bulkRow" style="display:none">
+        <span class="bulk-row-label">Bulk actions:</span>
+        <button class="btn btn-sm btn-outline" id="selectAllBtn" onclick="selectAllProducts()" style="display:none">☑ Select All</button>
+        <button class="btn btn-sm btn-outline" id="deselectAllBtn" onclick="deselectAllProducts()" style="display:none">☐ Deselect All</button>
+        <button class="btn btn-sm btn-success" id="bulkApproveBtn" onclick="bulkApprove()" style="display:none">
+          ✅ Bulk Approve (<span id="bulkApproveCount">0</span>)
+        </button>
+        <button class="btn btn-sm btn-danger" id="bulkDisapproveBtn" onclick="bulkDisapprove()" style="display:none">
+          🚫 Bulk Disapprove (<span id="bulkCount">0</span>)
+        </button>
+      </div>
+      <!-- Row 2b: Bulk grade — annotation mode (hidden in iteration mode) -->
+      <div class="bulk-row" id="bulkGradeRow" style="display:none">
+        <span class="bulk-row-label">Bulk grade:</span>
+        <button class="btn btn-sm btn-outline" id="annSelectAllBtn" onclick="selectAllProducts()" style="display:none">☑ Select All</button>
+        <button class="btn btn-sm btn-outline" id="annDeselectAllBtn" onclick="deselectAllProducts()" style="display:none">☐ Deselect All</button>
+        <button class="btn btn-sm btn-grade-0" onclick="bulkGradeAction(0)" title="Grade selected/filtered products as 0">0 — Not relevant</button>
+        <button class="btn btn-sm btn-grade-1" onclick="bulkGradeAction(1)" title="Grade selected/filtered products as 1">1 — Relevant</button>
+        <button class="btn btn-sm btn-grade-2" onclick="bulkGradeAction(2)" title="Grade selected/filtered products as 2">2 — Perfect</button>
+      </div>
+    </div>
+
+    <!-- LOAD NOTIFICATIONS PANEL -->
+    <div id="loadNotifications" class="load-notifications" style="display:none">
+      <div class="load-notifications-inner">
+        <div id="loadNotificationsBody"></div>
+        <button class="btn btn-sm btn-ghost" onclick="document.getElementById('loadNotifications').style.display='none'">Dismiss ✕</button>
+      </div>
+    </div>
+
+    <!-- QA DONE BAR -->
+    <div class="qa-done-bar" id="qaDoneBar" style="display:none">
+      <div class="keyword-label" id="qaKeywordLabel"></div>
+      <div class="keyword-stats" id="qaKeywordStats"></div>
+      <button class="btn btn-sm btn-success" id="qaMarkDoneBtn" onclick="markQaDone()">✅ Mark QA Done</button>
+      <button class="btn btn-sm btn-outline" id="qaRevertBtn" onclick="revertQaDone()" style="display:none">↩ Revert</button>
+    </div>
+
+    <!-- EMPTY STATE -->
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">📦</div>
+      <h2>Load your QA data to begin</h2>
+      <p>Click <strong>"Load Data Folder"</strong> in the sidebar and select the <code>qa_data/</code> folder.</p>
+      <p>See <code>qa_data/README.md</code> for the required file formats.</p>
+    </div>
+
+    <!-- PRODUCT GRID -->
+    <div class="product-grid" id="productGrid"></div>
+  </main>
+</div>
+
+<!-- DETAIL MODAL -->
+<div class="modal-backdrop" id="modalBackdrop" onclick="closeModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeModal()">✕</button>
+    <div class="modal-body">
+      <div class="modal-images">
+        <img id="modalImage" src="" alt="Product">
+        <div class="modal-thumbnails" id="modalThumbnails"></div>
+      </div>
+      <div class="modal-info">
+        <h2 id="modalTitle"></h2>
+        <div class="modal-attrs" id="modalAttrs"></div>
+        <div class="modal-pid"><code id="modalPid"></code></div>
+        <div class="modal-actions">
+          <button class="btn btn-danger" id="modalDisapproveBtn" onclick="disapproveFromModal()">🚫 Disapprove</button>
+          <!-- Annotation mode grade buttons (hidden in iteration mode) -->
+          <div id="gradeButtonsWrap" style="display:none; gap:8px; flex-wrap:wrap">
+            <button class="btn btn-grade-0" id="gradeBtn0" onclick="gradeFromModal(0)">0 — Not relevant</button>
+            <button class="btn btn-grade-1" id="gradeBtn1" onclick="gradeFromModal(1)">1 — Relevant</button>
+            <button class="btn btn-grade-2" id="gradeBtn2" onclick="gradeFromModal(2)">2 — Perfect</button>
+          </div>
+        </div>
+        <!-- DISAPPROVAL REASON FORM -->
+        <div class="reason-form" id="reasonForm" style="display:none">
+          <h4>Reason for disapproval:</h4>
+          <div class="reason-options">
+            <label><input type="radio" name="reason" value="wrong_product_category" onchange="handleReasonChange()"> Wrong Product Category</label>
+            <label><input type="radio" name="reason" value="wrong_gender" onchange="handleReasonChange()"> Wrong Gender</label>
+            <label><input type="radio" name="reason" value="wrong_brand" onchange="handleReasonChange()"> Wrong Brand</label>
+            <label><input type="radio" name="reason" value="ambiguous_data" onchange="handleReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
+            <label><input type="radio" name="reason" value="attribute_mismatch" onchange="handleReasonChange()"> Attribute mismatch</label>
+            <label><input type="radio" name="reason" value="other_reason" onchange="handleReasonChange()"> Other</label>
+          </div>
+          <div id="attrSelectWrap" style="display:none">
+            <select id="attrSelect" class="filter-select" onchange="handleAttrChange()">
+              <option value="">Select attribute…</option>
+              <option value="material">Material or fabric</option>
+              <option value="occasion">Occasion</option>
+            </select>
+          </div>
+          <div id="reasonOtherWrap" style="display:none">
+            <input type="text" id="reasonOtherText" class="search-input" placeholder="Describe the reason…" style="margin-top:6px" oninput="validateDisapprovalForm()">
+          </div>
+          <button class="btn btn-primary btn-sm" id="confirmDisapproval" onclick="confirmDisapproval()" disabled>Confirm Disapproval</button>
+        </div>
+        <!-- PRODUCT DUMP SEARCH -->
+        <div class="dump-search-wrap">
+          <input type="text" class="search-input" id="modalDumpSearch" placeholder="Search in product dump…" oninput="searchProductDump()" onkeydown="if(event.key==='Enter'){event.preventDefault();navigateDumpMatch(event.shiftKey?-1:1);}">
+          <span class="dump-search-count" id="dumpSearchCount"></span>
+          <button class="btn dump-nav-btn" id="dumpNavPrev" onclick="navigateDumpMatch(-1)" title="Previous match" style="display:none">&#8593;</button>
+          <button class="btn dump-nav-btn" id="dumpNavNext" onclick="navigateDumpMatch(1)" title="Next match" style="display:none">&#8595;</button>
+        </div>
+        <!-- JSON DUMP -->
+        <details class="json-dump" open>
+          <summary>Full Product Dump (JSON)</summary>
+          <pre id="modalJsonDump"></pre>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BULK DISAPPROVAL MODAL -->
+<div class="modal-backdrop" id="bulkModalBackdrop" onclick="closeBulkModal()" style="display:none">
+  <div class="modal modal-sm" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeBulkModal()">✕</button>
+    <h3>Bulk Disapproval</h3>
+    <p id="bulkModalCount"></p>
+    <div class="reason-form">
+      <h4>Reason:</h4>
+      <div class="reason-options">
+        <label><input type="radio" name="bulkReason" value="wrong_product_category" onchange="handleBulkReasonChange()"> Wrong Product Category</label>
+        <label><input type="radio" name="bulkReason" value="wrong_gender" onchange="handleBulkReasonChange()"> Wrong Gender</label>
+        <label><input type="radio" name="bulkReason" value="wrong_brand" onchange="handleBulkReasonChange()"> Wrong Brand</label>
+        <label><input type="radio" name="bulkReason" value="ambiguous_data" onchange="handleBulkReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
+        <label><input type="radio" name="bulkReason" value="attribute_mismatch" onchange="handleBulkReasonChange()"> Attribute mismatch</label>
+        <label><input type="radio" name="bulkReason" value="other_reason" onchange="handleBulkReasonChange()"> Other</label>
+      </div>
+      <div id="bulkAttrWrap" style="display:none">
+        <select id="bulkAttrSelect" class="filter-select" onchange="handleBulkAttrChange()">
+          <option value="">Select attribute…</option>
+          <option value="material">Material or fabric</option>
+          <option value="occasion">Occasion</option>
+        </select>
+      </div>
+      <div id="bulkReasonOtherWrap" style="display:none">
+        <input type="text" id="bulkReasonOtherText" class="search-input" placeholder="Describe the reason…" style="margin-top:6px" oninput="validateBulkForm()">
+      </div>
+      <button class="btn btn-danger" id="bulkConfirmBtn" onclick="confirmBulkDisapproval()" disabled>Confirm Bulk Disapproval</button>
+    </div>
+  </div>
+</div>
+
+<!-- HIDDEN FILE INPUT FOR IMPORT -->
+<input type="file" id="importInput" accept=".json" hidden onchange="handleImport(event)">
+
+<!-- MERGE PANEL MODAL -->
+<div class="modal-backdrop" id="mergePanelBackdrop" style="display:none" onclick="closeMergePanel()">
+  <div class="modal merge-modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeMergePanel()">✕</button>
+    <h3 class="merge-title">🔀 Merge Output Folders</h3>
+    <p class="merge-subtitle">Load each contributor's <code>labels_store.json</code> and <code>qa_metadata.json</code>. Conflicts will be nulled out and flagged for review.</p>
+
+    <!-- File pickers -->
+    <div class="merge-pickers">
+      <!-- Person A -->
+      <div class="merge-person-col">
+        <div class="merge-person-header merge-a-header">
+          <span class="merge-person-label">Person A</span>
+          <input type="text" class="merge-name-input" id="mergeNameA" placeholder="Name (e.g. Lisha)" />
+        </div>
+        <label class="merge-file-drop" id="dropZoneA_labels" onclick="document.getElementById('fileA_labels').click()">
+          <span class="merge-file-icon">📄</span>
+          <span class="merge-file-hint" id="hintA_labels">labels_store.json</span>
+          <input type="file" id="fileA_labels" accept=".json" hidden onchange="handleMergeFile('A','labels',event)">
+        </label>
+        <label class="merge-file-drop" id="dropZoneA_meta" onclick="document.getElementById('fileA_meta').click()">
+          <span class="merge-file-icon">📄</span>
+          <span class="merge-file-hint" id="hintA_meta">qa_metadata.json</span>
+          <input type="file" id="fileA_meta" accept=".json" hidden onchange="handleMergeFile('A','meta',event)">
+        </label>
+      </div>
+
+      <div class="merge-vs">⇄</div>
+
+      <!-- Person B -->
+      <div class="merge-person-col">
+        <div class="merge-person-header merge-b-header">
+          <span class="merge-person-label">Person B</span>
+          <input type="text" class="merge-name-input" id="mergeNameB" placeholder="Name (e.g. Shweta)" />
+        </div>
+        <label class="merge-file-drop" id="dropZoneB_labels" onclick="document.getElementById('fileB_labels').click()">
+          <span class="merge-file-icon">📄</span>
+          <span class="merge-file-hint" id="hintB_labels">labels_store.json</span>
+          <input type="file" id="fileB_labels" accept=".json" hidden onchange="handleMergeFile('B','labels',event)">
+        </label>
+        <label class="merge-file-drop" id="dropZoneB_meta" onclick="document.getElementById('fileB_meta').click()">
+          <span class="merge-file-icon">📄</span>
+          <span class="merge-file-hint" id="hintB_meta">qa_metadata.json</span>
+          <input type="file" id="fileB_meta" accept=".json" hidden onchange="handleMergeFile('B','meta',event)">
+        </label>
+      </div>
+    </div>
+
+    <!-- Run button -->
+    <div style="text-align:center;margin:18px 0 4px">
+      <button class="btn btn-merge-run" id="mergeRunBtn" onclick="runMerge()" disabled>
+        🔀 Run Merge
+      </button>
+    </div>
+
+    <!-- Results area (hidden until merge runs) -->
+    <div id="mergeResults" style="display:none">
+      <div class="merge-stats-row" id="mergeStatsRow"></div>
+
+      <!-- Conflict table -->
+      <div id="mergeConflictSection" style="display:none">
+        <div class="merge-conflict-header">
+          <span class="merge-conflict-title">⚠ Label Conflicts — <span id="mergeConflictCount">0</span> items need review</span>
+          <span class="merge-conflict-hint">These keyword+product pairs were labeled differently. Current label is <code>null</code>. Resolve each below.</span>
+        </div>
+        <div class="merge-conflict-table-wrap">
+          <table class="merge-conflict-table">
+            <thead>
+              <tr>
+                <th>Keyword</th>
+                <th>Product ID</th>
+                <th class="col-a">A Label</th>
+                <th class="col-b">B Label</th>
+                <th>Resolve</th>
+              </tr>
+            </thead>
+            <tbody id="mergeConflictTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Download buttons -->
+      <div class="merge-download-row">
+        <button class="btn btn-primary" onclick="downloadMerged('labels_store')">📥 Download labels_store.json</button>
+        <button class="btn btn-primary" onclick="downloadMerged('qa_metadata')">📥 Download qa_metadata.json</button>
+        <button class="btn btn-success" onclick="loadMergedIntoSession()" id="loadMergedBtn">⚡ Load into Session</button>
+      </div>
+      <p class="merge-load-hint">
+        "Load into Session" replaces the current session's labels and metadata with the merged result.
+        Unresolved conflicts (null labels) will appear as unlabeled items.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script src="merge.js"></script>
+
+<!-- RELABEL CONFIRMATION MODAL -->
+<div class="modal-backdrop" id="relabelBackdrop" onclick="closeRelabelModal()" style="display:none">
+  <div class="modal modal-sm" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeRelabelModal()">✕</button>
+    <h3>Correct Label</h3>
+    <div class="relabel-info">
+      <div class="relabel-row">
+        <span class="relabel-label-name">Current label:</span>
+        <strong id="relabelCurrentLabel"></strong>
+      </div>
+      <div class="relabel-arrow">↓</div>
+      <div class="relabel-row">
+        <span class="relabel-label-name">Change to:</span>
+        <strong id="relabelNewLabel"></strong>
+      </div>
+    </div>
+    <div class="relabel-reason-wrap">
+      <label class="relabel-reason-label">Why was this label incorrect? <span class="required-star">*</span></label>
+      <textarea id="relabelReason" class="relabel-reason-input" rows="3"
+                placeholder="Describe the correction reason…"
+                oninput="validateRelabelForm()"></textarea>
+    </div>
+    <div class="relabel-actions">
+      <button class="btn btn-danger" id="relabelConfirmBtn" onclick="confirmRelabel()" disabled>Confirm Relabel</button>
+      <button class="btn btn-ghost" onclick="closeRelabelModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- QUICK REASON POPUP -->
+<div class="quick-reason-popup" id="quickReasonPopup" style="display:none">
+  <h4>Reason for disapproval:</h4>
+  <div class="reason-options">
+    <label><input type="radio" name="qrReason" value="wrong_product_category" onchange="handleQrReasonChange()"> Wrong Product Category</label>
+    <label><input type="radio" name="qrReason" value="wrong_gender" onchange="handleQrReasonChange()"> Wrong Gender</label>
+    <label><input type="radio" name="qrReason" value="wrong_brand" onchange="handleQrReasonChange()"> Wrong Brand</label>
+    <label><input type="radio" name="qrReason" value="ambiguous_data" onchange="handleQrReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
+    <label><input type="radio" name="qrReason" value="attribute_mismatch" onchange="handleQrReasonChange()"> Attribute mismatch</label>
+    <label><input type="radio" name="qrReason" value="other_reason" onchange="handleQrReasonChange()"> Other</label>
+  </div>
+  <div id="qrAttrWrap" style="display:none">
+    <select id="qrAttrSelect" class="filter-select" onchange="handleQrAttrChange()">
+      <option value="">Select attribute…</option>
+      <option value="material">Material or fabric</option>
+      <option value="occasion">Occasion</option>
+    </select>
+  </div>
+  <div id="qrReasonOtherWrap" style="display:none">
+    <input type="text" id="qrReasonOtherText" class="search-input" placeholder="Describe the reason…" style="margin-top:6px" oninput="validateQrForm()">
+  </div>
+  <div style="display:flex;gap:6px;margin-top:8px">
+    <button class="btn btn-sm btn-danger" id="qrConfirmBtn" onclick="confirmQuickDisapproval()" disabled>Confirm</button>
+    <button class="btn btn-sm btn-ghost" onclick="closeQuickReason()">Cancel</button>
+  </div>
+</div>
+
+<!-- TOAST NOTIFICATION -->
+<!-- USER SELECTION BANNER -->
+<div id="userBanner" class="user-banner">
+  <span class="user-banner-icon">👋</span>
+  <span class="user-banner-text">Who's reviewing?</span>
+  <select id="bannerUserSelect" class="filter-select user-banner-select" onchange="handleBannerUserChange()">
+    <option value="">Select your name…</option>
+    <option value="Sonus">Sonus</option>
+    <option value="Lisha">Lisha</option>
+    <option value="Shweta">Shweta</option>
+  </select>
+  <button class="user-banner-dismiss" onclick="dismissUserBanner()" title="Dismiss">✕</button>
+</div>
+
+<div id="toastMessage" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
