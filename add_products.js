@@ -244,9 +244,25 @@ function addProductsPopulateFilterValues() {
   }
 }
 
+/** Paint a "Searching…" state in the count slot before the (blocking) compute
+ *  runs, so large pools never look frozen. */
+function showAddSearching() {
+  const count = document.getElementById('addProductsCount');
+  if (count) { count.textContent = 'Searching…'; count.classList.add('searching'); }
+}
+
 function onAddSearchInput() {
   clearTimeout(_addSearchDebounce);
+  showAddSearching();
   _addSearchDebounce = setTimeout(addProductsApplyFilters, 200);
+}
+
+/** Filter dropdowns/inputs: show the indicator, then defer the compute one tick
+ *  so the "Searching…" paint happens before the main thread blocks. */
+function onAddFilterChange() {
+  clearTimeout(_addSearchDebounce);
+  showAddSearching();
+  _addSearchDebounce = setTimeout(addProductsApplyFilters, 0);
 }
 
 function addProductsApplyFilters() {
@@ -271,6 +287,7 @@ function renderAddProductsGrid() {
   const index = getAddSourceIndex();
   const total = addDialogCandidates.length;
 
+  count.classList.remove('searching');
   count.textContent = total === 0 ? 'No matching live products'
     : (total > ADD_GRID_CAP ? `Showing first ${ADD_GRID_CAP} of ${total}` : `${total} product${total === 1 ? '' : 's'}`);
 

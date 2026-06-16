@@ -1913,3 +1913,94 @@ mark.dump-highlight-active {
 .bulk-row .btn-grade-1 { font-size: 12px; padding: 5px 12px; }
 .bulk-row .btn-grade-2 { font-size: 12px; padding: 5px 12px; }
 
+
+/* ── Add Products dialog ─────────────────────────────────────── */
+.add-products-btn { margin-left: 8px; }
+
+.add-products-modal {
+  width: 85vw;
+  height: 85vh;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+.add-products-title { margin: 0 0 4px; font-size: 18px; }
+.add-products-title span { color: var(--accent-hover); }
+.add-products-subtitle { margin: 0 0 14px; color: var(--text-secondary); font-size: 13px; }
+
+.add-products-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.add-products-search { flex: 1; min-width: 220px; }
+.add-products-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+.add-products-bulk-row {
+  display: flex; align-items: center; gap: 8px;
+  margin: 12px 0 8px;
+}
+.add-products-count { color: var(--text-secondary); font-size: 13px; }
+
+.add-products-grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  padding: 4px;
+  min-height: 200px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+}
+.add-products-status {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: 14px; padding: 40px 0;
+}
+
+/* "Searching…" indicator in the count slot while the search/filter recomputes. */
+.add-products-count.searching {
+  color: var(--accent);
+  font-style: italic;
+}
+.add-products-count.searching::before {
+  content: "";
+  display: inline-block;
+  width: 11px; height: 11px;
+  margin-right: 7px;
+  vertical-align: -1px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.add-card {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color .12s, background .12s;
+}
+.add-card:hover { background: var(--bg-card-hover); border-color: var(--border-light); }
+.add-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.add-card-check { position: absolute; top: 6px; left: 6px; z-index: 2; }
+.add-card-check input { width: 16px; height: 16px; cursor: pointer; }
+.add-card-img {
+  height: 120px; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-secondary); overflow: hidden;
+}
+.add-card-img img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.add-card-body { padding: 8px; }
+.add-card-title {
+  font-size: 12px; font-weight: 500; color: var(--text-primary);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; line-height: 1.3;
+}
+.add-card-meta { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+.add-card-price { font-size: 12px; color: var(--text-secondary); margin-top: 3px; }
+
+.add-products-footer {
+  display: flex; justify-content: flex-end; gap: 10px;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}

@@ -744,6 +744,75 @@ function findHistoricalIndexFile(files, retailer) {
   );
 }
 
+// INDEXEDDB CACHE — parsed annotation indexes, so a repeat load of the same
+// retailer/file skips the whole streaming parse.  All access is best-effort:
+// any failure (private mode, quota, no IndexedDB) silently falls back to parse.
+const IDB_NAME = 'qa_assortment_cache';
+const IDB_STORE = 'indexes';
+
+function _idbOpen() {
+  return new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(IDB_NAME, 1); }
+    catch (e) { reject(e); return; }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+/** Stable cache key for a parsed annotation index.  Includes file identity
+ *  (name+size+lastModified), the recency day-stamp (the 90-day filter is
+ *  date-relative, so a key valid today must miss tomorrow), and a hash of the
+ *  golden-PID set (editing the CSV must invalidate the golden subset).  Pure —
+ *  dayStamp is passed in so callers control time. */
+function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids, dayStamp) {
+  const pids = (allowedPids || []).slice().sort();
+  let h = 5381;
+  for (let i = 0; i < pids.length; i++) {
+    const s = String(pids[i]);
+    for (let j = 0; j < s.length; j++) h = ((h << 5) + h + s.charCodeAt(j)) | 0;
+  }
+  const pidSig = pids.length + '_' + (h >>> 0).toString(36);
+  return [retailer, fileName, size, lastModified, dayStamp, pidSig].join('::');
+}
+
+async function idbGetIndex(key) {
+  try {
+    const db = await _idbOpen();
+    return await new Promise((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror   = () => reject(req.error);
+    });
+  } catch (_) { return null; }
+}
+
+async function idbPutIndex(key, retailer, value) {
+  try {
+    const db = await _idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx    = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      // Keep at most one entry per retailer — prune older file/day variants.
+      const cur = store.openKeyCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (c) {
+          if (typeof c.key === 'string' && c.key.startsWith(retailer + '::') && c.key !== key) store.delete(c.key);
+          c.continue();
+        }
+      };
+      store.put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => reject(tx.error);
+    });
+  } catch (_) { /* cache write is best-effort */ }
+}
+
 async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
   // 1. Find the index file
   const jsonlFiles = files.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
@@ -775,6 +844,23 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
   const fileSizeKB = Math.round(indexFile.size / 1024);
   console.log(`[Annotation] Streaming "${indexFile.name}" (${fileSizeKB} KB), looking for ${allowedPids.length} PIDs…`);
 
+  const loadingMsg = (typeof document !== 'undefined') ? document.getElementById('loadingMsg') : null;
+
+  // 2b. IndexedDB cache — a repeat load of this file/retailer/day skips the parse.
+  const dayStamp = Math.floor(Date.now() / 86400000);
+  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp);
+  if (loadingMsg) loadingMsg.textContent = `Loading cached ${retailer} index…`;
+  const cached = await idbGetIndex(cacheKey);
+  if (cached && cached.productIndex && cached.fullIndex) {
+    productIndex = cached.productIndex;
+    productDumps = cached.productDumps || {};
+    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, cached.fullDumps || {}, retailer);
+    const n = Object.keys(productIndex).length;
+    console.log(`[Annotation] Cache hit "${cacheKey}" — ${n} products, parse skipped`);
+    notifications.push({ type: 'info', text: `"${indexFile.name}": loaded ${n} products from cache (instant).` });
+    return;
+  }
+
   // 3. Detect gzip with a 4-byte peek (tiny slice, no full read)
   let isGzip = false;
   try {
@@ -787,14 +873,23 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
     let stream = indexFile.stream();
     if (isGzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
 
+    // Live progress in the loading overlay — total size is unknown for gzip,
+    // so we report a running count rather than a fake percentage.
+    const onProgress = loadingMsg
+      ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
+      : null;
+
     const { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps } =
-      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true });
+      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
 
     // Seed the Add Products cache from this same pass — no second file read.
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
+
+    // Persist for instant repeat loads (best-effort, non-blocking).
+    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps });
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -834,9 +929,10 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
   const liveOnly = !!opts.liveOnly;
   const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
   const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
-  let parsed = 0, skipped = 0, skippedStale = 0;
+  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
@@ -875,7 +971,10 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
       else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
     }
     // The full live pool feeds Add Products without a second file read.
-    if (buildFullLive && isLive) { fullIndex[pid] = record; fullDumps[pid] = docDump; }
+    if (buildFullLive && isLive) {
+      fullIndex[pid] = record; fullDumps[pid] = docDump;
+      if (onProgress && (++fullCount % 2000 === 0)) onProgress(fullCount);
+    }
   };
 
   // Stream chunks through a TextDecoder, accumulate partial lines in `remainder`
@@ -901,6 +1000,8 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   } finally {
     reader.releaseLock();
   }
+
+  if (onProgress) onProgress(fullCount);   // land on the true total
 
   return { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps };
 }
