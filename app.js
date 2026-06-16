@@ -138,7 +138,7 @@ function normalizeProductRecord(raw, pid) {
   toStrList(r.all_images).forEach(addImg);
   const images = [...imgSet];
 
-  return {
+  const record = {
     product_id:   toStr(pid || r.product_id || (dump && dump.product_id) || r.id || r._id),
     title:        firstNonEmpty(r.title, dump && dump.title),
     image_url:    firstNonEmpty(images[0], r.image_url),
@@ -157,6 +157,14 @@ function normalizeProductRecord(raw, pid) {
     liveness:     r.product_liveness !== undefined ? toBool(r.product_liveness, true)
                   : (r.liveness !== undefined ? toBool(r.liveness, true) : true),
   };
+  // Precomputed search haystack (curated fields, ~100 chars) — lets the Add
+  // Products free-text search run .includes() instead of scanning multi-KB dump
+  // strings. Deep dump search remains available via the product_dump filter.
+  record.searchText = [
+    record.title, record.brand, record.product_type,
+    record.color, record.material, record.occasion, record.category,
+  ].map(toStr).filter(Boolean).join(' ').toLowerCase();
+  return record;
 }
 
 // FILTER HELPERS
@@ -180,44 +188,41 @@ function strictContains(haystack, needle) {
   return new RegExp(`\\b${escaped}\\b`, 'i').test(h);
 }
 
-/** Test whether a single PID satisfies one filter spec. */
+/** Test whether a single PID satisfies one filter spec.
+ *  Grade/label are keyword-scoped and handled here; content/attribute fields
+ *  delegate to the shared productMatchesContentFilter (in add_products.js). */
 function _pidMatchesFilter(pid, field, operator, value) {
   if (!pid || !field || !value) return true;
-  let matches = false;
 
   if (field === 'grade') {
     const grade = annGetGrade(currentUser, activeKeyword.keyword, pid);
-    matches = value === 'unlabeled' ? grade === null : grade === parseInt(value, 10);
-
-  } else if (field === 'label') {
-    const key = `${activeKeyword.keyword}::${pid}`;
-    if (value === 'approved')  matches = !!approvals[key];
-    else if (value === 'rejected') matches = !!disapprovals[key];
-
-  } else if (field === 'product_dump') {
-    ensureDumpCache(getBasePids());
-    matches = strictContains(dumpFilterCache[pid] || '', value);
-
-  } else if (field === 'description') {
-    const dump = productDumps[pid] || {};
-    const desc = (dump.description || dump.body_html || (productIndex[pid] || {}).description || '');
-    matches = strictContains(desc, value);
-
-  } else if (field === 'title') {
-    const p = productIndex[pid];
-    matches = p ? strictContains(p.title || '', value) : false;
-
-  } else {
-    // Categorical attribute — exact token match (comma-separated field values).
-    // Coerce defensively: legacy or pre-built indexes may store numbers/arrays
-    // for these fields and (123).split would crash.
-    const p = productIndex[pid];
-    if (!p) return operator === 'not_contains';
-    const tokens = toStr(p[field]).split(/,\s*/).map(t => t.trim().toLowerCase()).filter(Boolean);
-    matches = tokens.some(t => t === toStr(value).toLowerCase());
+    const matches = value === 'unlabeled' ? grade === null : grade === parseInt(value, 10);
+    return operator === 'not_contains' ? !matches : matches;
   }
 
-  return operator === 'not_contains' ? !matches : matches;
+  if (field === 'label') {
+    const key = `${activeKeyword.keyword}::${pid}`;
+    let matches = false;
+    if (value === 'approved')  matches = !!approvals[key];
+    else if (value === 'rejected') matches = !!disapprovals[key];
+    return operator === 'not_contains' ? !matches : matches;
+  }
+
+  let dumpStr = '';
+  if (field === 'product_dump') {
+    ensureDumpCache(getBasePids());
+    dumpStr = dumpFilterCache[pid] || '';
+  }
+
+  // Resolve description from the dump first (preserves prior behavior), then index.
+  let record = productIndex[pid];
+  if (field === 'description') {
+    const dump = productDumps[pid] || {};
+    const desc = (dump.description || dump.body_html || (record || {}).description || '');
+    record = Object.assign({}, record, { description: desc });
+  }
+
+  return productMatchesContentFilter(record, dumpStr, field, operator, value);
 }
 
 /** Recompute filteredPids as the intersection of all activeFilters.
@@ -725,17 +730,27 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
  *  string length limit and silently decode to "".  Instead we pipe through TextDecoderStream
  *  and process line-by-line, keeping only the handful of matching product records in memory.
  */
+/** Resolve the historical-index JSONL file for a retailer, tolerating case
+ *  and naming drift.  Shared by the annotation loader and the Add Products
+ *  full-live-index loader (add_products.js). */
+function findHistoricalIndexFile(files, retailer) {
+  const jsonlFiles = files.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
+  const exact      = `${retailer}_historical_index.jsonl`;
+  return (
+    files.find(f => f.name === exact) ||
+    files.find(f => f.name.toLowerCase() === exact) ||
+    jsonlFiles.find(f => f.name.toLowerCase().includes(retailer)) ||
+    (jsonlFiles.length === 1 ? jsonlFiles[0] : null)
+  );
+}
+
 async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
   // 1. Find the index file
   const jsonlFiles = files.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
   const jsonlNames = jsonlFiles.map(f => f.name);
   const exact      = `${retailer}_historical_index.jsonl`;
 
-  const indexFile =
-    files.find(f => f.name === exact) ||
-    files.find(f => f.name.toLowerCase() === exact) ||
-    jsonlFiles.find(f => f.name.toLowerCase().includes(retailer)) ||
-    (jsonlFiles.length === 1 ? jsonlFiles[0] : null);
+  const indexFile = findHistoricalIndexFile(files, retailer);
 
   if (!indexFile) {
     const hint = jsonlNames.length
@@ -772,11 +787,14 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
     let stream = indexFile.stream();
     if (isGzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale } =
-      await _parseAnnotationJsonlStream(stream, allowedPids);
+    const { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps } =
+      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true });
 
     productIndex = newIndex;
     productDumps = newDumps;
+
+    // Seed the Add Products cache from this same pass — no second file read.
+    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -800,6 +818,7 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
   } catch (e) {
     notifications.push({ type: 'error', text: `Failed to parse "${indexFile.name}": ${e.message}` });
     productIndex = {}; productDumps = {};
+    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(null);   // fall back to lazy stream
   }
 }
 
@@ -811,9 +830,12 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
  *  - doc.product_dump.images, doc.product_dump.image  →  images live inside product_dump
  *  - doc.product_dump.product_id  →  also a valid PID source (checked as fallback)
  */
-async function _parseAnnotationJsonlStream(stream, allowedPids) {
-  const allowed  = new Set(allowedPids);
+async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
+  const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
+  const liveOnly = !!opts.liveOnly;
+  const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
   const newIndex = {}, newDumps = {};
+  const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
   let parsed = 0, skipped = 0, skippedStale = 0;
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
@@ -839,12 +861,21 @@ async function _parseAnnotationJsonlStream(stream, allowedPids) {
     const pid = toStr(doc.product_id || doc.id || doc._id
       || (dump && (dump.product_id || dump.id)));
     if (!pid) { skipped++; return; }
-    if (!allowed.has(pid)) return;   // not in this retailer's golden dataset
+
+    const inGolden = !allowed || allowed.has(pid);
+    if (!inGolden && !buildFullLive) return;   // wanted by neither pool — skip the normalize
 
     // Single source of truth for shape — every catalog variant funnels here.
-    newIndex[pid] = normalizeProductRecord(doc, pid);
-    newDumps[pid] = dump || doc;   // store product_dump for the modal JSON viewer
-    parsed++;
+    const record  = normalizeProductRecord(doc, pid);
+    const docDump = dump || doc;   // store product_dump for the modal JSON viewer
+    const isLive  = record.liveness !== false;
+
+    if (inGolden) {
+      if (liveOnly && !isLive) { skipped++; }   // Add Products fallback: live only
+      else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
+    }
+    // The full live pool feeds Add Products without a second file read.
+    if (buildFullLive && isLive) { fullIndex[pid] = record; fullDumps[pid] = docDump; }
   };
 
   // Stream chunks through a TextDecoder, accumulate partial lines in `remainder`
@@ -871,7 +902,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids) {
     reader.releaseLock();
   }
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -908,6 +939,7 @@ async function switchAnnotationRetailer(retailer) {
     filteredPids  = null;
     selectedPids.clear();
     dumpFilterDirty = true;
+    if (typeof resetFullLiveIndex === 'function') resetFullLiveIndex();
 
     renderKeywordList();
     if (keywords.length > 0) selectKeyword(0);
@@ -932,6 +964,9 @@ async function handleFolderLoad(dirHandle) {
   const loadingMsg = document.getElementById('loadingMsg');
   overlay.classList.add('active');
   const notifications = [];
+
+  // New folder → drop any cached full live index from a prior session.
+  if (typeof resetFullLiveIndex === 'function') resetFullLiveIndex();
 
   // Annotation mode detection
   // If the folder contains a golden_dataset_labelled_desc*.csv file, switch to
