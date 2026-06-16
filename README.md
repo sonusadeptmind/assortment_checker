@@ -36,6 +36,49 @@ To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pa
 
 ---
 
+# What We're Measuring
+
+Four metrics evaluate landing-page quality, and the QA grades you assign in this dashboard are the input signal for all of them.
+
+| Metric | Question it answers | Target |
+|---|---|---|
+| **Precision** | Of the products we show, what fraction are actually relevant? | Monitored |
+| **Recall** | Of the products we should show, how many did we include? | Monitored |
+| **F1** | Is the relevance classifier balancing precision and recall well? | ≥ 80% |
+| **nDCG@8** | Are the best (grade-2) products at the top of the first 8 positions? | ≥ 80% |
+
+- **Precision** and **Recall** use binary relevance — grade **1 or 2** counts as relevant, grade **0** does not. **F1** is the harmonic mean of the two.
+- **nDCG@8** uses the full 0 / 1 / 2 graded scale across the first 8 ranking positions, so placing a grade-2 product at position 7 is penalised even if it's "on the page."
+- Every evaluation must report **per-retailer breakdowns** as well as the aggregate — a strong overall score can hide a single retailer that's underperforming.
+
+> Full definitions, worked examples, target rationale, and evaluation rules (golden-dataset holdout, no relabelling, etc.) live in **OKR1 — Canonical Metrics Definition Document** (DLP ML team). This README intentionally keeps metric definitions short — defer to the OKR doc for anything ambiguous.
+
+---
+
+# Relevance Grades (0 / 1 / 2)
+
+Both Iteration Mode and Annotation Mode use the **same graded relevance scale**. A grade captures how relevant a product is for a given keyword — think of it as a relevance quality score, not a pass/fail flag.
+
+| Grade | Label | Definition | Aligns with |
+|------:|---|---|---|
+| **0** | Not relevant | The product does not match the keyword in any meaningful way. | `relevance = False` |
+| **1** | Relevant | The product is related to the keyword and is a reasonable result, but it's not the best possible match. May be a related category, a partial match, or a substitute. | `relevance = True` |
+| **2** | Perfect | The product is an exact or near-exact match for the keyword. A user searching this term would be very satisfied with this result. | `relevance = True` |
+
+## Why grades matter — model training signal
+
+These grades are the supervised signal used to train the ranking model. They don't just say "include / exclude" — they also encode **ordering**:
+
+- Grade **2** products are pushed to the **top** of the result list (the model learns to rank them highest).
+- Grade **1** products come **after** the grade-2 set (relevant, but ranked below the perfect matches).
+- Grade **0** products are penalised away from the result set.
+
+In other words, the grades tell the model not just *which* products belong, but in *what order* they should appear. Spending the extra second to choose between 1 and 2 directly improves ranking quality — a card you grade 2 will outrank a card you grade 1 in production.
+
+> **Default state:** Unlabeled. QA only acts on cards that need a grade. Cards left unlabeled at export are treated as approved-by-default in iteration mode and as ungraded in annotation mode.
+
+---
+
 # Iteration Mode
 
 ## Input Folder
@@ -108,13 +151,19 @@ When the file is loaded, the dashboard reads the `hash_key` value and sets it as
 
 ## Reviewing Products
 
-- **Disapprove** — hover a card and click 🚫, or open the detail view and click 🚫 Disapprove. A reason is required.
-- **Bulk actions** — use Select All or checkboxes, then Bulk Approve / Bulk Disapprove in the toolbar.
+Iteration mode now uses the same **0 / 1 / 2 grading scale** as annotation mode (see [Relevance Grades](#relevance-grades-0--1--2) above). Each card gets a graded relevance label rather than a binary approve/disapprove.
+
+- **Grade a card** — hover a card to see the quick-grade pills `[ 0 ] [ 1 ] [ 2 ]`, or open the detail view for the full grade buttons.
+- **Grade 0** opens the reason form — a reason is required (Wrong Category / Gender / Brand / Ambiguous / Attribute Mismatch / Other).
+- **Grade 1** and **Grade 2** apply immediately. Use 2 for exact / near-exact matches and 1 for reasonable-but-not-best matches.
+- **Bulk actions** — use Select All or checkboxes, then **Bulk 0 / Bulk 1 / Bulk 2** in the toolbar. Bulk-0 opens the shared reason modal; Bulk-1 and Bulk-2 apply immediately.
 - Filters and the Prior Iterations toggle are automatically cleared after every bulk action.
 
-**Disapproval reasons:** Wrong Product Category · Wrong Gender · Wrong Brand · Ambiguous product data · Attribute mismatch (Material / Occasion / Other) · Other (free-text)
+**Grade-0 reasons:** Wrong Product Category · Wrong Gender · Wrong Brand · Ambiguous product data · Attribute mismatch (Material / Occasion / Other) · Other (free-text)
 
 **Detail view** — click any card to open. Includes full product dump JSON with searchable fields and ↑ ↓ navigation across matches.
+
+> Cards left ungraded at export are treated as approved-by-default for backwards compatibility with the previous Approve/Disapprove workflow.
 
 ### Filtering
 
@@ -126,8 +175,7 @@ The toolbar has a single unified filter bar: **Filter By** → **Operator** → 
 | Title | Debounced text box | Searches product title |
 | Description | Debounced text box | Searches description / body_html |
 | Brand, Color, Product Type, Material, Occasion | Auto-populated dropdown | Exact token match on comma-separated field values |
-| Label | Dropdown: Approved / Rejected | Filters by current label state (iteration mode) |
-| Grade | Dropdown: 0 / 1 / 2 / Unlabeled | Filters by graded relevance (annotation mode) |
+| Grade | Dropdown: 0 / 1 / 2 / Unlabeled | Filters by graded relevance (both iteration and annotation mode) |
 
 **Operator:** `contains` or `does not contain` — applies to all field types.
 
@@ -137,7 +185,7 @@ Selecting a new field clears the previous filter. Clear button resets to the def
 
 | Toggle | Default | Description |
 |---|---|---|
-| 👁 Show Labeled | Off | Shows products in the current review set that have already been approved or disapproved (or graded, in annotation mode) |
+| 👁 Show Labeled | Off | Shows products in the current review set that have already been graded (any of 0, 1, or 2) |
 | 🕑 Prior Iterations | Off | (Iteration mode only) Shows products from previous iterations (`tp_ids` / `fp_ids` in `dataset.csv`) that are not in the current review set. These appear with a dashed border and a **PRIOR** badge. Resets when switching keywords or clearing filters. |
 
 > **Metrics (Total / Approved / Disapproved / Hit Rate) always reflect the current review set only**, even when the Prior Iterations toggle is on. Prior cards are for human reference and do not affect metric computation — this keeps evaluation signal clean and consistent across iterations.
@@ -150,15 +198,80 @@ On first load a banner appears at the bottom of the screen prompting you to sele
 
 | Button | Output | Description |
 |---|---|---|
-| 📥 Export CSV | `outputs/dataset.csv` | Updated dataset with all TP / FP labels |
+| 📥 Export CSV | `outputs/dataset.csv` | Updated dataset with graded labels |
 | 💾 Save | `outputs/qa_metadata.json`, `labels_store.json`, `iteration_history.json` | Full session state |
 | 📤 Import | — | Restore a saved `qa_metadata.json` |
 
-**Export CSV columns:**
-- `pids_to_include` — all PIDs labeled TP for the keyword
-- `pids_to_remove` — all PIDs labeled FP for the keyword
-- `new_pids_approved` — PIDs explicitly approved this session
+**Export CSV columns** (graded labels are bucketed for backwards-compatible TP / FP semantics):
+
+- `pids_to_include` — all PIDs graded **1** or **2** for the keyword (relevant)
+- `pids_to_remove` — all PIDs graded **0** for the keyword (not relevant)
+- `pids_grade_2` — PIDs graded **2** (perfect / near-exact match) — used by the ranker to learn top-of-list ordering
+- `pids_grade_1` — PIDs graded **1** (relevant but not best) — ranked below grade-2 PIDs
 - `manual_qa_status` — TRUE if Mark QA Done was clicked
+
+---
+
+# Tranche QA
+
+A lightweight, day-to-day operational workflow for grading model output to monitor ongoing model health. Use this when QA'ing a regular tranche (daily / weekly) of keywords — there's no `new_iteration.xlsx`, no hash key, no prior-iteration history. Just the model's current candidates for a set of keywords.
+
+Tranche QA runs under iteration mode (the file is still `dataset.csv`), but only the two columns below need to be populated.
+
+## When to use
+
+- Routine cadence checks against the live model (sanity / regression watch).
+- Spot-checking a slice of keywords before a full iteration cycle is run.
+- Operational QA where the goal is "is the model healthy today?" rather than "is iteration N better than N-1?".
+
+## Input Folder
+
+| File | Required | Description |
+|---|---|---|
+| `dataset.csv` | ✅ | Tranche keywords + candidate product IDs |
+| `catalog.jsonl` | ✅ | Vendor catalog (subject to the 90-day `updated_at` filter) |
+
+No `new_iteration.xlsx` is needed. The Iteration ID badge will show `—`.
+
+## dataset.csv Format (Tranche)
+
+Only the two columns below are required. All other iteration-mode columns may be empty or omitted.
+
+| Column | Required | Description |
+|---|---|---|
+| `keyword` | ✅ | Search query |
+| `results_editor_re` | ✅ | Candidate product IDs returned by the model for that keyword |
+
+PID lists accept `pid1|pid2|pid3`, `pid1,pid2,pid3`, or `['pid1','pid2']` format (same as iteration mode).
+
+> Same column as iteration mode — Tranche QA is a different *usage* of `results_editor_re`, not a different schema. No code changes are needed to switch between the two flows.
+
+### Sample
+
+| keyword | results_editor_re |
+|---|---|
+| running shoes | 1001\|1002\|1003\|1004 |
+| black t-shirt | 2010,2011,2012 |
+| winter coat | ['3050','3051','3052'] |
+| leather wallet | 4400\|4401 |
+
+## Workflow
+
+```
+1. Drop the day's dataset.csv + catalog.jsonl into a folder
+2. Load the folder in the dashboard
+3. Per keyword: grade each card 0 / 1 / 2 → Mark QA Done
+     - 0 = not relevant (reason required)
+     - 1 = relevant, not best
+     - 2 = perfect / near-exact match
+4. 💾 Save → 📥 Export CSV
+5. Hand the exported dataset.csv back to ML/Ops
+   - pids_to_remove = grade-0 PIDs (FP feedback)
+   - pids_grade_1 / pids_grade_2 = ranking signal for the next training run
+   - manual_qa_status = TRUE for keywords you finished
+```
+
+Tranche owners are tracked via the active user (selected in the bottom banner on first load) and the timestamp in `qa_metadata.json`.
 
 ---
 
@@ -166,11 +279,7 @@ On first load a banner appears at the bottom of the screen prompting you to sele
 
 Lets reviewers assign a graded relevance label per `(keyword, product_id)` row in a shared golden-dataset CSV. Each reviewer's labels live in `{user}_*` columns so the QA team can collaborate on a single shared file without overwriting each other.
 
-| Grade | Meaning | Aligns with |
-|------:|---|---|
-| **0** | Not relevant | `relevance = False` |
-| **1** | Relevant (reasonable, not best) | `relevance = True` |
-| **2** | Perfect / near-exact match | `relevance = True` |
+Annotation mode uses the shared **0 / 1 / 2 grading scale** — see [Relevance Grades](#relevance-grades-0--1--2) for definitions and how grades drive model training.
 
 ## Input Folder
 
@@ -260,6 +369,16 @@ Three bulk buttons in place of two:
 - **Bulk-1 / Bulk-2** apply immediately.
 - Filters reset after every bulk action (same behavior as iteration mode).
 
+## Add Products
+
+The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword (defaulting to **grade 1 / Relevant** in annotation mode, **Approved** in iteration mode) — useful when a relevant product was missing from the original assortment.
+
+- **Search** matches a curated field set (title, brand, type, color, material, occasion, category). For a deep search across the full product JSON, switch the filter field to **Product Dump**.
+- Only live products are shown; anything already tied to the keyword is excluded.
+- Added products are written back on CSV export (a golden row is appended so the addition survives a round-trip).
+
+See [Performance → Annotation-mode index loading & Add Products](#annotation-mode-index-loading--add-products) for the single-pass build, IndexedDB cache, and progress loaders behind this.
+
 ## Save / Import / Merge
 
 Same buttons as iteration mode; payloads differ:
@@ -329,7 +448,7 @@ Outputs `iteration_N_report.xlsx` with two tabs:
 ```
 1. Receive new_iteration.xlsx from ML engineer
 2. Load your input folder in the dashboard
-3. Review each keyword — disapprove FPs, click Mark QA Done
+3. Review each keyword — grade cards 0 / 1 / 2, click Mark QA Done
 4. 💾 Save → 📥 Export CSV
 5. Run scripts/evaluate_iteration.py
 6. Share Summary tab metrics with ML engineer
@@ -363,6 +482,15 @@ On product click → lazy-load ProductDump (cached after first fetch)
 A typical session loads 50–500 products (~100–200 KB in memory). Key rules: fetch only relevant `product_ids`, filter on `ProductIndex` fields only, never filter on raw JSON dumps, and cache `ProductDump` objects after first fetch.
 
 The 90-day historical-index filter typically drops a meaningful chunk of stale records (often a third or more of a multi-month catalog), shrinking what the browser holds in memory.
+
+### Annotation-mode index loading & Add Products
+
+The `{retailer}_historical_index.jsonl` files can be large, and the **Add Products** dialog needs the *whole* live catalog (not just golden-set PIDs). To keep loads fast and the UI responsive:
+
+- **Single-pass index build** — one stream of the file builds *both* the golden-set index (the review grid, any liveness) and the full live pool (Add Products). Opening Add Products triggers **no second file read**.
+- **IndexedDB cache** — the parsed index is cached (DB `qa_assortment_cache`); a repeat load of the same retailer skips the parse entirely and loads near-instantly. The cache key combines file identity (name + size + last-modified), a day-stamp (so the date-relative 90-day filter can't serve stale data across days), and a hash of the golden-PID set (editing the CSV re-parses). It's best-effort — private mode, quota limits, or no IndexedDB silently fall back to parsing — and keeps at most one entry per retailer.
+- **Precomputed `searchText`** — each record carries a short, lowercased search string (title, brand, type, color, material, occasion, category). The Add Products free-text box searches that, not multi-KB raw dumps. For deep dump search, set the filter field to **Product Dump**, which scans the full dump JSON lazily (only for candidates that already passed the search/attribute filters).
+- **Progress loaders** — the loading overlay shows a live count while the index is being built (`Building <retailer> index… N live products`) and `Loading cached index…` on a cache hit; the Add Products dialog shows a `Searching…` indicator while a search/filter recomputes.
 
 ---
 

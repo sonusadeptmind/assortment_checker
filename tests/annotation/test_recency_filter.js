@@ -48,6 +48,13 @@ eq('empty string returns null', parseUpdatedAt(''), null);
 eq('garbage string returns null', parseUpdatedAt('not a date'), null);
 eq('empty array returns null', parseUpdatedAt([]), null);
 
+// Bare "YYYY-MM-DD HH:MM:SS" (no timezone) must parse as UTC, so the 90-day
+// window is identical regardless of the machine's local timezone.
+assert('space-separator parses as UTC (tz-independent)',
+  parseUpdatedAt('2026-02-06 00:00:00').getTime() === Date.UTC(2026, 1, 6, 0, 0, 0));
+assert('iso "T" without tz parses as UTC',
+  parseUpdatedAt('2026-04-15T12:00:00').getTime() === Date.UTC(2026, 3, 15, 12, 0, 0));
+
 assert('iso-Z parses', parseUpdatedAt('2026-04-15T12:00:00Z') instanceof Date);
 assert('iso-no-Z parses', parseUpdatedAt('2026-04-15T12:00:00+00:00') instanceof Date);
 assert('space-separator (production format) parses',
