@@ -2036,11 +2036,11 @@ function searchProductDump() {
     return;
   }
 
-  // Highlight all whole-word matches
+  // Highlight all substring matches
   let matchCount = 0;
   const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const highlighted = escapeHtml(dumpStr).replace(
-    new RegExp(`\\b(${escaped})\\b`, 'gi'),
+    new RegExp(`(${escaped})`, 'gi'),
     (m) => { matchCount++; return `<mark class="dump-highlight">${m}</mark>`; }
   );
   pre.innerHTML = highlighted;

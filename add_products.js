@@ -15,10 +15,11 @@ let _fullLiveIndexRetailer = null;
 let addDialogDumpCache   = {};   // pid → lowercased dump JSON, built lazily for the product_dump filter
 let addDialogSelected    = new Set();
 let addDialogCandidates  = [];   // current filtered candidate pids
+let addDialogPage        = 0;    // 0-indexed current page of the candidate list
 let _addSearchDebounce   = null;
 
 const ADD_TEXT_FIELDS = new Set(['product_dump', 'title', 'description']);
-const ADD_GRID_CAP    = 300;     // cap rendered cards for performance
+const ADD_PAGE_SIZE   = 32;      // candidates rendered per page (8 rows × 4 cols)
 
 // PURE MATCHERS
 
@@ -278,6 +279,7 @@ function addProductsApplyFilters() {
   addDialogCandidates = computeAddCandidates(
     getAddSourceIndex(), getAddDumpStr, keywordExistingPids(activeKeyword), filters, search
   );
+  addDialogPage = 0;             // new result set → back to the first page
   renderAddProductsGrid();
 }
 
@@ -286,17 +288,26 @@ function renderAddProductsGrid() {
   const count = document.getElementById('addProductsCount');
   const index = getAddSourceIndex();
   const total = addDialogCandidates.length;
+  const pages = Math.max(1, Math.ceil(total / ADD_PAGE_SIZE));
+
+  // Clamp the page in case the candidate set shrank since the last render.
+  if (addDialogPage > pages - 1) addDialogPage = pages - 1;
+  if (addDialogPage < 0) addDialogPage = 0;
 
   count.classList.remove('searching');
-  count.textContent = total === 0 ? 'No matching live products'
-    : (total > ADD_GRID_CAP ? `Showing first ${ADD_GRID_CAP} of ${total}` : `${total} product${total === 1 ? '' : 's'}`);
 
   if (total === 0) {
+    count.textContent = 'No matching live products';
     grid.innerHTML = '<div class="add-products-status">No live products match — adjust the search or filter.</div>';
+    renderAddProductsPager(0, 0);
     return;
   }
 
-  grid.innerHTML = addDialogCandidates.slice(0, ADD_GRID_CAP).map(pid => {
+  const start = addDialogPage * ADD_PAGE_SIZE;
+  const end   = Math.min(start + ADD_PAGE_SIZE, total);
+  count.textContent = `Showing ${start + 1}–${end} of ${total}`;
+
+  grid.innerHTML = addDialogCandidates.slice(start, end).map(pid => {
     const p = index[pid] || {};
     const isSel = addDialogSelected.has(pid);
     const price = p.price ? `$${Number(p.price).toFixed(2)}` : '';
@@ -304,16 +315,46 @@ function renderAddProductsGrid() {
       <div class="add-card-check">
         <input type="checkbox" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleAddSelect('${pid}')">
       </div>
+      <div class="add-card-header">
+        <div class="add-card-title">${escapeHtml(p.title || pid)}</div>
+      </div>
       <div class="add-card-img">
         ${p.image_url ? `<img src="${p.image_url}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}
       </div>
       <div class="add-card-body">
-        <div class="add-card-title">${escapeHtml(p.title || pid)}</div>
         <div class="add-card-meta">${escapeHtml(p.brand || '')}${p.color ? ' · ' + escapeHtml((p.color || '').split(',')[0].trim()) : ''}</div>
         ${price ? `<div class="add-card-price">${price}</div>` : ''}
       </div>
     </div>`;
   }).join('');
+
+  renderAddProductsPager(addDialogPage, pages);
+}
+
+/** Render the Prev / page X of N / Next controls below the grid. Hidden when
+ *  the candidate set fits on a single page. */
+function renderAddProductsPager(page, pages) {
+  const pager = document.getElementById('addProductsPager');
+  if (!pager) return;
+  if (pages <= 1) { pager.innerHTML = ''; return; }
+  pager.innerHTML =
+    `<button class="btn btn-sm btn-outline" onclick="addProductsSetPage(-1)" ${page <= 0 ? 'disabled' : ''}>‹ Prev</button>`
+    + `<span class="add-products-pageinfo">Page ${page + 1} of ${pages}</span>`
+    + `<button class="btn btn-sm btn-outline" onclick="addProductsSetPage(1)" ${page >= pages - 1 ? 'disabled' : ''}>Next ›</button>`;
+}
+
+/** Step to an adjacent page, re-render, and scroll the grid back to the top. */
+function addProductsSetPage(delta) {
+  addDialogPage += delta;
+  renderAddProductsGrid();
+  const grid = document.getElementById('addProductsGrid');
+  if (grid) grid.scrollTop = 0;
+}
+
+/** PIDs shown on the current page — the on-screen pool for bulk select/deselect. */
+function addProductsCurrentPagePids() {
+  const start = addDialogPage * ADD_PAGE_SIZE;
+  return addDialogCandidates.slice(start, start + ADD_PAGE_SIZE);
 }
 
 function toggleAddSelect(pid) {
@@ -331,13 +372,13 @@ function toggleAddSelect(pid) {
 }
 
 function selectAllAddCandidates() {
-  addDialogCandidates.forEach(pid => addDialogSelected.add(pid));
+  addProductsCurrentPagePids().forEach(pid => addDialogSelected.add(pid));
   renderAddProductsGrid();
   updateAddConfirmBtn();
 }
 
 function deselectAllAddCandidates() {
-  addDialogSelected.clear();
+  addProductsCurrentPagePids().forEach(pid => addDialogSelected.delete(pid));
   renderAddProductsGrid();
   updateAddConfirmBtn();
 }
