@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=2">
 <!-- SheetJS for reading new_iteration.xlsx directly from the browser -->
 <script src="vendor/xlsx.full.min.js"></script>
 <!-- Annotation mode modules (loaded before app.js) -->
@@ -17,6 +17,8 @@
 <script src="annotation/bulk.js"></script>
 <!-- Auto-save module (must load before app.js so scheduleAutoSave is defined) -->
 <script src="autosave.js"></script>
+<!-- Add Products module (loaded before app.js so productMatchesContentFilter is defined) -->
+<script src="add_products.js?v=2"></script>
 </head>
 <body>
 <!-- LOADING OVERLAY -->
@@ -133,6 +135,7 @@
         <span id="gridProductCount" class="grid-count-chip" style="display:none"></span>
         <button id="showLabelsBtn" class="btn btn-sm toggle-pill" onclick="toggleShowLabels()" title="Show products already labeled in the current review set">👁 Show Labeled</button>
         <button id="showPriorBtn" class="btn btn-sm toggle-pill" onclick="toggleShowPrior()" title="Show products labeled in prior iterations that are not in the current review set">🕑 Prior Iterations</button>
+        <button id="addProductsBtn" class="btn btn-sm btn-primary add-products-btn" onclick="openAddProductsModal()" title="Search live products and add them to this keyword (default grade 1 / approved)">➕ Add Products</button>
       </div>
       <!-- Active filter pills row -->
       <div class="filter-pills-row" id="filterPillsRow" style="display:none"></div>
@@ -217,6 +220,9 @@
             <label><input type="radio" name="reason" value="wrong_product_category" onchange="handleReasonChange()"> Wrong Product Category</label>
             <label><input type="radio" name="reason" value="wrong_gender" onchange="handleReasonChange()"> Wrong Gender</label>
             <label><input type="radio" name="reason" value="wrong_brand" onchange="handleReasonChange()"> Wrong Brand</label>
+            <label><input type="radio" name="reason" value="wrong_color" onchange="handleReasonChange()"> Wrong Color</label>
+            <label><input type="radio" name="reason" value="wrong_product_line" onchange="handleReasonChange()"> Wrong Product Line</label>
+            <label><input type="radio" name="reason" value="wrong_age_group" onchange="handleReasonChange()"> Wrong Age Group</label>
             <label><input type="radio" name="reason" value="ambiguous_data" onchange="handleReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
             <label><input type="radio" name="reason" value="attribute_mismatch" onchange="handleReasonChange()"> Attribute mismatch</label>
             <label><input type="radio" name="reason" value="other_reason" onchange="handleReasonChange()"> Other</label>
@@ -262,6 +268,9 @@
         <label><input type="radio" name="bulkReason" value="wrong_product_category" onchange="handleBulkReasonChange()"> Wrong Product Category</label>
         <label><input type="radio" name="bulkReason" value="wrong_gender" onchange="handleBulkReasonChange()"> Wrong Gender</label>
         <label><input type="radio" name="bulkReason" value="wrong_brand" onchange="handleBulkReasonChange()"> Wrong Brand</label>
+        <label><input type="radio" name="bulkReason" value="wrong_color" onchange="handleBulkReasonChange()"> Wrong Color</label>
+        <label><input type="radio" name="bulkReason" value="wrong_product_line" onchange="handleBulkReasonChange()"> Wrong Product Line</label>
+        <label><input type="radio" name="bulkReason" value="wrong_age_group" onchange="handleBulkReasonChange()"> Wrong Age Group</label>
         <label><input type="radio" name="bulkReason" value="ambiguous_data" onchange="handleBulkReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
         <label><input type="radio" name="bulkReason" value="attribute_mismatch" onchange="handleBulkReasonChange()"> Attribute mismatch</label>
         <label><input type="radio" name="bulkReason" value="other_reason" onchange="handleBulkReasonChange()"> Other</label>
@@ -277,6 +286,61 @@
         <input type="text" id="bulkReasonOtherText" class="search-input" placeholder="Describe the reason…" style="margin-top:6px" oninput="validateBulkForm()">
       </div>
       <button class="btn btn-danger" id="bulkConfirmBtn" onclick="confirmBulkDisapproval()" disabled>Confirm Bulk Disapproval</button>
+    </div>
+  </div>
+</div>
+
+<!-- ADD PRODUCTS MODAL -->
+<div class="modal-backdrop" id="addProductsBackdrop" onclick="closeAddProductsModal()" style="display:none">
+  <div class="modal add-products-modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeAddProductsModal()">✕</button>
+    <h3 class="add-products-title">➕ Add products to: <span id="addProductsKeyword"></span></h3>
+    <p class="add-products-subtitle">Search all still-live products from the historical index. Added products default to <strong>grade 1 (Relevant)</strong> in annotation mode and <strong>Approved</strong> in iteration mode.</p>
+
+    <!-- Search + filter controls -->
+    <div class="add-products-controls">
+      <input type="text" id="addSearchInput" class="search-input add-products-search" placeholder="Search live products…" oninput="onAddSearchInput()">
+      <div class="add-products-filter">
+        <select id="addFilterField" class="filter-select" onchange="addProductsPopulateFilterValues(); onAddFilterChange()" title="Filter by">
+          <option value="product_dump">Product Dump</option>
+          <option value="title">Title</option>
+          <option value="description">Description</option>
+          <option disabled>──────────</option>
+          <option value="brand">Brand</option>
+          <option value="color">Color</option>
+          <option value="product_type">Product Type</option>
+          <option value="material">Material</option>
+          <option value="occasion">Occasion</option>
+        </select>
+        <select id="addFilterOperator" class="filter-select" onchange="onAddFilterChange()" title="Match operator">
+          <option value="contains">contains</option>
+          <option value="not_contains">does not contain</option>
+        </select>
+        <input type="text" id="addFilterValueText" class="filter-text-input" placeholder="Whole-word search…" oninput="onAddFilterChange()" style="width:180px">
+        <select id="addFilterValueSelect" class="filter-select" onchange="onAddFilterChange()" style="display:none">
+          <option value="">Select value…</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Bulk select row -->
+    <div class="add-products-bulk-row">
+      <span id="addProductsCount" class="add-products-count"></span>
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-sm btn-outline" onclick="selectAllAddCandidates()">☑ Select All</button>
+      <button class="btn btn-sm btn-outline" onclick="deselectAllAddCandidates()">☐ Deselect All</button>
+    </div>
+
+    <!-- Results grid -->
+    <div id="addProductsGrid" class="add-products-grid"></div>
+
+    <!-- Pagination -->
+    <div id="addProductsPager" class="add-products-pager"></div>
+
+    <!-- Footer -->
+    <div class="add-products-footer">
+      <button class="btn btn-ghost" onclick="closeAddProductsModal()">Cancel</button>
+      <button class="btn btn-primary" id="addProductsConfirmBtn" onclick="confirmAddProducts()" disabled>Add products</button>
     </div>
   </div>
 </div>
@@ -417,6 +481,9 @@
     <label><input type="radio" name="qrReason" value="wrong_product_category" onchange="handleQrReasonChange()"> Wrong Product Category</label>
     <label><input type="radio" name="qrReason" value="wrong_gender" onchange="handleQrReasonChange()"> Wrong Gender</label>
     <label><input type="radio" name="qrReason" value="wrong_brand" onchange="handleQrReasonChange()"> Wrong Brand</label>
+    <label><input type="radio" name="qrReason" value="wrong_color" onchange="handleQrReasonChange()"> Wrong Color</label>
+    <label><input type="radio" name="qrReason" value="wrong_product_line" onchange="handleQrReasonChange()"> Wrong Product Line</label>
+    <label><input type="radio" name="qrReason" value="wrong_age_group" onchange="handleQrReasonChange()"> Wrong Age Group</label>
     <label><input type="radio" name="qrReason" value="ambiguous_data" onchange="handleQrReasonChange()"> Ambiguous product data <span class="reason-hint">contradicting info in the product_dump</span></label>
     <label><input type="radio" name="qrReason" value="attribute_mismatch" onchange="handleQrReasonChange()"> Attribute mismatch</label>
     <label><input type="radio" name="qrReason" value="other_reason" onchange="handleQrReasonChange()"> Other</label>

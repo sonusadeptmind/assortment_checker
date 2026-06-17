@@ -26,7 +26,13 @@ function parseUpdatedAt(value) {
       const n = Number(s);
       return new Date(n > 1e11 ? n : n * 1000);
     }
-    const dt = new Date(s);
+    // Normalize a bare "YYYY-MM-DD HH:MM[:SS]" (no timezone) to UTC so the
+    // 90-day window is timezone-independent — production ships these bare and
+    // means UTC; left to the engine they'd parse as local time.
+    let norm = s;
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)$/.exec(s);
+    if (m) norm = `${m[1]}T${m[2]}Z`;
+    const dt = new Date(norm);
     return isNaN(dt.getTime()) ? null : dt;
   }
   return null;
