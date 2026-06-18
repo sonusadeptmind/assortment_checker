@@ -434,7 +434,10 @@ function confirmAddProducts() {
         keyword: kw, product_id: pid, created_at: now,
         meta_data: { user: currentUser, added: true },
       };
-      recordLabelChange(kw, pid, 'TP');
+      // The product is relevant (human-approved) but was NOT returned by the
+      // model — it is a false negative, not a true positive. Labeling it FN keeps
+      // it out of the precision numerator while counting it as a recall miss.
+      recordLabelChange(kw, pid, 'FN', null, null, null, 'added_not_in_model_output');
     }
   });
 

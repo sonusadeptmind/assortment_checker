@@ -36,16 +36,18 @@ function safeRound(v, dp = 4) {
 function computeKeywordMetrics(kw, catalog = {}) {
   const knownTps = new Set();
   const knownFps = new Set();
+  const knownFns = new Set();   // relevant but missed by the model (e.g. added by hand)
   (kw.labels || []).forEach(({ product_id, label }) => {
     if (label === "TP") knownTps.add(product_id);
     else if (label === "FP") knownFps.add(product_id);
+    else if (label === "FN") knownFns.add(product_id);
   });
 
   const newProductIds = new Set(kw.re_product_ids || []);
   const hasNewIteration = newProductIds.size > 0;
 
   // OOS from catalog.product_liveness (mirrors evaluate_iteration.py exactly)
-  const allRelevantPids = new Set([...newProductIds, ...knownTps, ...knownFps]);
+  const allRelevantPids = new Set([...newProductIds, ...knownTps, ...knownFps, ...knownFns]);
   const oosPids = new Set([...allRelevantPids].filter(p => {
     const entry = catalog[p];
     return entry !== undefined && entry.liveness === false;
@@ -59,22 +61,28 @@ function computeKeywordMetrics(kw, catalog = {}) {
   // OOS-aware TP partitions — computed before precision/recall.
   const availableTps     = new Set([...knownTps].filter(p => !oosPids.has(p)));
   const tpInNewAvailable = new Set([...tpInNew].filter(p => availableTps.has(p)));
+  const availableFns     = new Set([...knownFns].filter(p => !oosPids.has(p)));
 
-  // Bug 3 gate: empty results + in-stock TPs → real failure, score as 0.
-  const emptyButHasAvailableTps = !hasNewIteration && availableTps.size > 0;
+  // Bug 3 gate: empty results + in-stock relevant items (TPs or FNs) → failure, score as 0.
+  const emptyButHasAvailableTps =
+    !hasNewIteration && (availableTps.size + availableFns.size) > 0;
 
   const labeledPrecision = labeledCount > 0
     ? tpInNew.size / labeledCount
     : (emptyButHasAvailableTps ? 0 : null);
 
-  // standard_recall: naturally 0 when knownTps exist but newProductIds is empty
-  const standardRecall = knownTps.size > 0
-    ? tpInNew.size / knownTps.size
+  // standard_recall: relevant retrieved / all relevant (known TPs + known FNs).
+  // FNs enlarge the denominator only (never retrieved), lowering recall for
+  // keywords whose relevant products were added by hand rather than returned.
+  const relevantCount = knownTps.size + knownFns.size;
+  const standardRecall = relevantCount > 0
+    ? tpInNew.size / relevantCount
     : null;
 
-  // stock_adj_recall: naturally 0 when availableTps exist but newProductIds is empty
-  const stockAdjRecall = availableTps.size > 0
-    ? tpInNewAvailable.size / availableTps.size
+  // stock_adj_recall: denominator = in-stock relevant items (available TPs + FNs)
+  const availableRelevant = availableTps.size + availableFns.size;
+  const stockAdjRecall = availableRelevant > 0
+    ? tpInNewAvailable.size / availableRelevant
     : null;
 
   const fpInNewAvailable     = new Set([...fpInNew].filter(p => !oosPids.has(p)));
@@ -264,6 +272,59 @@ assertApprox(
     labels: [{product_id:"p1",label:"TP"}],
   }).standard_recall, 0
 );
+
+//  Tests: FN labels (products added by hand / missed by the model)
+
+console.log("── FN labels (added products → recall misses) ────────");
+
+// 2 TP in new results, 2 FN (relevant, not returned) → precision=1, recall=0.5
+{
+  const m = computeKeywordMetrics({
+    re_product_ids: ["p1","p2"],
+    labels: [
+      {product_id:"p1",label:"TP"},{product_id:"p2",label:"TP"},
+      {product_id:"p3",label:"FN"},{product_id:"p4",label:"FN"},
+    ],
+  });
+  assertApprox("FN: precision unaffected by FNs → 1.0", m.labeled_precision, 1.0);
+  assertApprox("FN: recall = 2/(2+2) → 0.5",            m.standard_recall,   0.5);
+  assertApprox("FN: f1 = 2*1*0.5/1.5 → 0.6667",         m.labeled_f1,        2/3, 0.001);
+}
+
+// All relevant items were added (FN), model returned nothing relevant → recall=0
+{
+  const m = computeKeywordMetrics({
+    re_product_ids: ["p_fp"],
+    labels: [{product_id:"p_fp",label:"FP"},{product_id:"p1",label:"FN"},{product_id:"p2",label:"FN"}],
+  });
+  assertApprox("FN: precision with only an FP in new → 0", m.labeled_precision, 0);
+  assertApprox("FN: recall 0/(0+2) → 0",                   m.standard_recall,   0);
+}
+
+// FNs do not affect precision when mixed with FPs in new results
+{
+  const m = computeKeywordMetrics({
+    re_product_ids: ["p1","p2","p3"],
+    labels: [
+      {product_id:"p1",label:"TP"},{product_id:"p2",label:"FP"},{product_id:"p3",label:"FP"},
+      {product_id:"p4",label:"FN"},
+    ],
+  });
+  assertApprox("FN: precision = 1/(1+2) → 0.3333", m.labeled_precision, 1/3, 0.001);
+  assertApprox("FN: recall = 1/(1+1) → 0.5",       m.standard_recall,   0.5);
+}
+
+// Stock-adjusted recall counts in-stock FNs in the denominator; OOS FN excluded
+{
+  const m = computeKeywordMetrics({
+    re_product_ids: ["p1"],
+    labels: [{product_id:"p1",label:"TP"},{product_id:"p2",label:"FN"},{product_id:"p3",label:"FN"}],
+  }, { p3: { liveness: false } });   // p3 FN is OOS → excluded from denominator
+  // available relevant = {p1 (TP), p2 (FN)} = 2; retrieved available TP = {p1} → 0.5
+  assertApprox("FN: stock_adj_recall excludes OOS FN → 0.5", m.stock_adj_recall, 0.5);
+  // standard_recall counts all FNs regardless of stock → 1/(1+2) = 0.3333
+  assertApprox("FN: standard_recall counts all FNs → 0.3333", m.standard_recall, 1/3, 0.001);
+}
 
 //  Tests: labeled_f1
 

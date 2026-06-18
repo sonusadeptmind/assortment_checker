@@ -2437,11 +2437,15 @@ function buildLabelsStore() {
     } else if (approvals[key]) {
       const a = approvals[key];
       const isSeeded = a.meta_data?.source === 'iteration_0';
+      // FN = relevant product not returned by the model (added via Add Products).
+      // It is approved (relevant) but absent from the model output, so it is a
+      // false negative rather than a true positive.
+      const isFn = iterationLabels[key]?.label === 'FN';
       labelsStore.push({
         keyword,
         product_id,
-        label:                'TP',
-        reason:               null,
+        label:                isFn ? 'FN' : 'TP',
+        reason:               isFn ? 'added_not_in_model_output' : null,
         attribute:            null,
         attribute_other_text: null,
         relabel_reason:       a.meta_data?.relabel_reason || null,
@@ -2461,15 +2465,20 @@ function computeKeywordMetrics(kw) {
   const kwName = kw.keyword;
   const safeRound = v => (v === null || v === undefined) ? null : parseFloat(v.toFixed(4));
 
-  // Collect known TPs and FPs from the live label store (iterationLabels)
+  // Collect known TPs, FPs and FNs from the live label store (iterationLabels).
+  // FN = relevant products the model did NOT return (e.g. added via the Add
+  // Products dialog). They never appear in new_product_ids, so they count only
+  // against recall (as missed relevant items), never against precision.
   const knownTps = new Set();
   const knownFps = new Set();
+  const knownFns = new Set();
   const prefix = kwName + '::';
   Object.entries(iterationLabels).forEach(([key, meta]) => {
     if (!key.startsWith(prefix)) return;
     const pid = key.slice(prefix.length);
     if (meta.label === 'TP') knownTps.add(pid);
     else if (meta.label === 'FP') knownFps.add(pid);
+    else if (meta.label === 'FN') knownFns.add(pid);
   });
 
   // new_product_ids = new_iteration_ids (from new_iteration.xlsx ONLY).
@@ -2481,7 +2490,7 @@ function computeKeywordMetrics(kw) {
   // Products absent from the catalog default to in-stock (liveness = true).
   // We check every PID relevant to this keyword: new results + all known labels.
   const allRelevantPids = new Set([
-    ...newProductIds, ...knownTps, ...knownFps,
+    ...newProductIds, ...knownTps, ...knownFps, ...knownFns,
   ]);
   const oosPids = new Set([...allRelevantPids].filter(p => {
     const entry = productIndex[p];
@@ -2499,29 +2508,39 @@ function computeKeywordMetrics(kw) {
   // emptyButHasAvailableTps gate below can use availableTps.
   const availableTps     = new Set([...knownTps].filter(p => !oosPids.has(p)));
   const tpInNewAvailable = new Set([...tpInNew].filter(p => availableTps.has(p)));
+  // In-stock FNs — relevant items the model missed, still available to retrieve.
+  const availableFns     = new Set([...knownFns].filter(p => !oosPids.has(p)));
 
-  // Bug 3 gate: empty results + in-stock TPs → real failure, score as 0.
-  // When the model returned nothing but known in-stock TPs existed, that is a
-  // genuine precision/recall failure and should count as 0 in aggregates.
-  // When there are no in-stock TPs either (all OOS or no TPs ever labeled),
+  // Bug 3 gate: empty results + in-stock relevant items → real failure, score as 0.
+  // When the model returned nothing but known in-stock relevant items existed
+  // (TPs or FNs), that is a genuine precision/recall failure and should count as
+  // 0 in aggregates.  When there are none (all OOS or nothing relevant labeled),
   // null is correct — there is no meaningful signal to average.
-  const emptyButHasAvailableTps = !hasNewIteration && availableTps.size > 0;
+  const emptyButHasAvailableTps =
+    !hasNewIteration && (availableTps.size + availableFns.size) > 0;
 
   // labeled_precision: TP / (TP+FP) over labeled new results.
   const labeledPrecision = labeledCount > 0
     ? tpInNew.size / labeledCount
     : (emptyButHasAvailableTps ? 0 : null);
 
-  // standard_recall: TP retrieved / all known TPs (regardless of stock status).
-  // Naturally 0 when knownTps exist but newProductIds is empty.
-  const standardRecall = knownTps.size > 0
-    ? tpInNew.size / knownTps.size
+  // standard_recall: relevant retrieved / all relevant items.
+  // All relevant = known TPs (retrieved & relevant) + known FNs (relevant but
+  // missed by the model). FNs are never in new_product_ids, so they enlarge the
+  // denominator only — correctly lowering recall for keywords whose relevant
+  // products were added by hand rather than returned by the model.
+  // Naturally 0 when relevant items exist but newProductIds is empty.
+  const relevantCount = knownTps.size + knownFns.size;
+  const standardRecall = relevantCount > 0
+    ? tpInNew.size / relevantCount
     : null;
 
-  // stock_adj_recall: excludes OOS TPs from denominator and numerator so recall ∈ [0,1].
-  // Naturally 0 when availableTps exist but newProductIds is empty.
-  const stockAdjRecall = availableTps.size > 0
-    ? tpInNewAvailable.size / availableTps.size
+  // stock_adj_recall: excludes OOS items from the denominator so recall ∈ [0,1].
+  // Denominator = in-stock relevant items (available TPs + available FNs).
+  // Naturally 0 when in-stock relevant items exist but newProductIds is empty.
+  const availableRelevant = availableTps.size + availableFns.size;
+  const stockAdjRecall = availableRelevant > 0
+    ? tpInNewAvailable.size / availableRelevant
     : null;
 
   // stock_adj_precision: restrict labeled set to in-stock products only.
@@ -2589,11 +2608,15 @@ function buildKeywordMetricsStore() {
   return doneKeywords.map(kw => {
     const metrics = computeKeywordMetrics(kw);
 
-    // Raw counts from approvals/disapprovals (same source as labels_store.json)
+    // Raw counts from approvals/disapprovals (same source as labels_store.json).
+    // An approved product carries label FN when it is not in the model output
+    // (added via the Add Products dialog); such products count as misses, not TPs.
     const prefix = kw.keyword + '::';
-    let tpCount = 0, fpCount = 0;
+    let tpCount = 0, fpCount = 0, fnCount = 0;
     Object.keys(approvals).forEach(key => {
-      if (key.startsWith(prefix)) tpCount++;
+      if (!key.startsWith(prefix)) return;
+      if (iterationLabels[key]?.label === 'FN') fnCount++;
+      else tpCount++;
     });
     Object.keys(disapprovals).forEach(key => {
       if (key.startsWith(prefix)) fpCount++;
@@ -2605,6 +2628,7 @@ function buildKeywordMetricsStore() {
       ...metrics,
       tp_count:            tpCount,
       fp_count:            fpCount,
+      fn_count:            fnCount,
       total_in_new:        newPids.length,
       labeled_count:       tpCount + fpCount,
       has_new_iteration:   newPids.length > 0,
