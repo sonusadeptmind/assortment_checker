@@ -1113,19 +1113,30 @@ function confirmKeepLiveOnly() {
 }
 
 async function handleFolderLoad(dirHandle) {
-  // Collect all flat files from the directory handle
-  const files = [];
+  // Collect file handles first — .name is available without taking a File
+  // snapshot, so we can decide whether to prompt without calling getFile() yet.
+  const fileHandles = [];
   for await (const [, entry] of dirHandle.entries()) {
-    if (entry.kind === 'file') files.push(await entry.getFile());
+    if (entry.kind === 'file') fileHandles.push(entry);
   }
 
   // Ask once per load whether to keep only live products, before the loading
   // overlay goes up. Only prompt when there's actually an index to build from
   // (a .jsonl/.jsonl.gz catalog or a pre-built product_index.json). Applies to
   // both the annotation and catalog/review load paths below.
-  const hasIndexFile = files.some(f =>
-    f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz') || f.name === 'product_index.json');
+  //
+  // This prompt MUST run before getFile() below: confirmKeepLiveOnly() blocks
+  // on human input, and a File snapshot taken before that wait can go stale by
+  // the time it's read, making the read throw NotReadableError ("…permission
+  // problems that have occurred after a reference to a file was acquired").
+  const hasIndexFile = fileHandles.some(h =>
+    h.name.endsWith('.jsonl') || h.name.endsWith('.jsonl.gz') || h.name === 'product_index.json');
   keepLiveOnly = hasIndexFile ? await confirmKeepLiveOnly() : false;
+
+  // Now take the File snapshots — immediately before they're read — so the
+  // snapshot-to-read window stays small regardless of how long the prompt sat open.
+  const files = [];
+  for (const h of fileHandles) files.push(await h.getFile());
 
   const overlay = document.getElementById('loadingOverlay');
   const loadingMsg = document.getElementById('loadingMsg');
@@ -1172,6 +1183,12 @@ async function handleFolderLoad(dirHandle) {
   };
 
   try {
+    // The catalog (historical index) can be multiple GB, so it is loaded LAST —
+    // after dataset.csv + new_iteration.xlsx tell us which product IDs it must
+    // contain. We then stream it and keep only those PIDs. Wrapped in
+    // loadCatalog() and invoked after Step 3 below.
+    const neededPids = new Set();
+    const loadCatalog = async () => {
     // 1. Catalog: pre-built JSON (fast) OR raw JSONL
     const idxFile  = getFile('product_index.json');
     const dumpFile = getFile('product_dumps.json');
@@ -1245,32 +1262,36 @@ async function handleFolderLoad(dirHandle) {
       console.log(`[Step 1] Parsing JSONL catalog: "${jsonlFile.name}" (${(jsonlFile.size / 1024 / 1024).toFixed(1)} MB)`);
       loadingMsg.textContent = `Parsing ${jsonlFile.name}…`;
 
-      // Decompress .gz files using the browser's native DecompressionStream API
-      let jsonlText;
-      if (jsonlFile.name.endsWith('.gz')) {
-        loadingMsg.textContent = `Decompressing ${jsonlFile.name}…`;
-        console.log('[Step 1] Decompressing .gz file…');
+      // Stream the catalog line by line. A multi-GB historical index must never
+      // be read via File.text(): the result would exceed V8's ~512 MB max string
+      // length and throw NotReadableError. We decode incrementally and keep only
+      // the products the dataset references (neededPids).
+      let stream = jsonlFile.stream();
+      let isGzip = /\.gz$/i.test(jsonlFile.name);
+      if (!isGzip) {
         try {
-          const decompressed = jsonlFile.stream().pipeThrough(new DecompressionStream('gzip'));
-          jsonlText = await new Response(decompressed).text();
-        } catch (e) {
+          const peek = new Uint8Array(await jsonlFile.slice(0, 2).arrayBuffer());
+          isGzip = peek[0] === 0x1f && peek[1] === 0x8b;   // gzip magic bytes
+        } catch (_) {}
+      }
+      if (isGzip) {
+        loadingMsg.textContent = `Decompressing ${jsonlFile.name}…`;
+        console.log('[Step 1] Decompressing .gz stream…');
+        try { stream = stream.pipeThrough(new DecompressionStream('gzip')); }
+        catch (e) {
           console.error('[Step 1] Decompression failed:', e);
           throw new Error(`Could not decompress "${jsonlFile.name}": ${e.message} — ensure it is a valid gzip file.`);
         }
-      } else {
-        try { jsonlText = await jsonlFile.text(); } catch (e) {
-          console.error(`[Step 1] Failed to read "${jsonlFile.name}":`, e);
-          throw new Error(`Could not read "${jsonlFile.name}": ${e.message}`);
-        }
       }
 
-      const lines = jsonlText.split('\n');
       const newIndex = {};
       const newDumps = {};
       let parsed = 0;
       let skipped = 0;
       let skippedStale = 0;
       let liveDropped = 0;
+      let seenValid = 0;     // valid, recent product records seen (before the PID filter)
+      let lineNo = 0;
       const parseErrors = [];
 
       const safeList = (v) => {
@@ -1281,22 +1302,20 @@ async function handleFolderLoad(dirHandle) {
       };
       const safeFirst = (arr, fallback) => (Array.isArray(arr) && arr.length) ? arr[0] : fallback;
 
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
+      const processLine = (raw) => {
+        lineNo++;
+        const line = raw.trim();
+        if (!line) return;
         let doc;
         try { doc = JSON.parse(line); } catch (e) {
           skipped++;
-          if (parseErrors.length < 3) parseErrors.push(`Line ${i + 1}: ${e.message} — "${line.slice(0, 80)}…"`);
-          continue;
+          if (parseErrors.length < 3) parseErrors.push(`Line ${lineNo}: ${e.message} — "${line.slice(0, 80)}…"`);
+          return;
         }
 
         // 90-day recency filter — skip records updated more than 90 days ago,
         // or with no parseable updated_at field.
-        if (!isRecentUpdate(pickUpdatedAt(doc))) {
-          skippedStale++;
-          continue;
-        }
+        if (!isRecentUpdate(pickUpdatedAt(doc))) { skippedStale++; return; }
 
         // PID can come in as a number, string, or nested in product_dump.
         // toStr handles every case; we drop only when it's truly empty.
@@ -1306,24 +1325,57 @@ async function handleFolderLoad(dirHandle) {
           || (dumpForPid && (dumpForPid.product_id || dumpForPid.id)));
         if (!pid) {
           skipped++;
-          if (parseErrors.length < 3) parseErrors.push(`Line ${i + 1}: missing "product_id" / "id" field`);
-          continue;
+          if (parseErrors.length < 3) parseErrors.push(`Line ${lineNo}: missing "product_id" / "id" field`);
+          return;
         }
+
+        seenValid++;
+        // Keep only products the dataset references (mirrors the annotation path,
+        // which filters this same index to its golden PID set).
+        if (neededPids.size > 0 && !neededPids.has(pid)) return;
 
         // Build the record through the normaliser so every catalog shape
         // (numeric titles, missing fields, nested product_dump, image arrays)
         // collapses to the same predictable schema.
         // product_liveness defaults to true for products not in catalog (mirrors evaluate_iteration.py).
         const rec = normalizeProductRecord(doc, pid);
-        if (keepLiveOnly && rec.liveness === false) { liveDropped++; continue; }   // live-only: drop dead products
+        if (keepLiveOnly && rec.liveness === false) { liveDropped++; return; }   // live-only: drop dead products
         newIndex[pid] = rec;
         newDumps[pid] = dumpForPid || doc;
         parsed++;
 
-        if (i % 500 === 0) loadingMsg.textContent = `Parsing ${jsonlFile.name}… (${parsed} products)`;
+        if (lineNo % 2000 === 0) {
+          loadingMsg.textContent = `Parsing ${jsonlFile.name}… (${parsed} of ${neededPids.size} matched, ${lineNo.toLocaleString()} lines scanned)`;
+        }
+      };
+
+      // Stream chunks through a TextDecoder, accumulating partial lines in `remainder`.
+      const reader = stream.pipeThrough(new TextDecoderStream('utf-8')).getReader();
+      let remainder = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (remainder.trim()) processLine(remainder);
+            break;
+          }
+          const chunk = remainder + value;
+          const nlIdx = chunk.lastIndexOf('\n');
+          if (nlIdx === -1) {
+            remainder = chunk;              // no complete line yet, keep buffering
+          } else {
+            remainder = chunk.slice(nlIdx + 1);
+            for (const l of chunk.slice(0, nlIdx).split('\n')) processLine(l);
+          }
+        }
+      } catch (e) {
+        console.error(`[Step 1] Failed to read "${jsonlFile.name}":`, e);
+        throw new Error(`Could not read "${jsonlFile.name}": ${e.message}`);
+      } finally {
+        reader.releaseLock();
       }
 
-      if (!parsed) {
+      if (!seenValid) {
         console.error(`[Step 1] No valid records parsed from "${jsonlFile.name}". Sample errors:`, parseErrors,
           '\nExpected: one JSON object per line with a "product_id" or "id" field.');
         throw new Error(
@@ -1332,6 +1384,9 @@ async function handleFolderLoad(dirHandle) {
           (parseErrors.length ? 'Sample issues:\n' + parseErrors.join('\n') : '') +
           '\nCheck the browser console for full details.'
         );
+      }
+      if (!parsed) {
+        console.warn(`[Step 1] "${jsonlFile.name}": ${seenValid.toLocaleString()} recent products scanned, but none matched the ${neededPids.size} dataset PIDs — all cards will show "Product not in catalog".`);
       }
 
       if (skipped > 0) {
@@ -1354,6 +1409,7 @@ async function handleFolderLoad(dirHandle) {
       notifications.push({ type: 'info',
         text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.${liveNote}` });
     }
+    };   // end loadCatalog — invoked after dataset.csv + new_iteration.xlsx below
 
     // 2. dataset.csv (required)
     console.log('[Step 2] Loading dataset.csv');
@@ -1383,17 +1439,19 @@ async function handleFolderLoad(dirHandle) {
     const { headers, rows } = parseCSV(csvText);
     console.log('[Step 2] dataset.csv headers found:', headers);
 
+    // Required columns drive keyword / PID extraction. If any are absent, add
+    // them as empty columns (header present, no values) so the file still loads
+    // — the affected fields just come through blank instead of blocking the load.
     const required = ['keyword', 'prod_ids', 'results_editor_re'];
     const missing  = required.filter(c => !headers.includes(c));
     if (missing.length) {
-      console.error('[Step 2] Missing required columns:', missing, '— columns present:', headers);
-      throw new Error(
-        `"dataset.csv" is missing required columns: ${missing.map(c => `"${c}"`).join(', ')}.\n\n` +
-        'Required: keyword, prod_ids, results_editor_re\n' +
-        'Optional: staging_ids, pids_to_include, pids_to_remove, manual_qa_status\n\n' +
-        `Columns found: ${headers.join(', ')}\n\n` +
-        'Check that the file uses comma delimiters and has a header row.'
-      );
+      console.warn('[Step 2] Missing required columns auto-added as empty:', missing, '— columns present:', headers);
+      missing.forEach(c => {
+        headers.push(c);
+        rows.forEach(r => { r[c] = ''; });
+      });
+      notifications.push({ type: 'warn',
+        text: `"dataset.csv" was missing required column${missing.length > 1 ? 's' : ''} ${missing.map(c => `"${c}"`).join(', ')} — added as empty so the file could load. Those values are blank; check the file if that's unexpected.` });
     }
 
     keywords = buildKeywordsFromCSV(rows);
@@ -1488,6 +1546,16 @@ async function handleFolderLoad(dirHandle) {
     } else {
       console.log('[Step 3] new_iteration.xlsx not found — skipping.');
     }
+
+    // Collect every PID the UI / metrics will look up, then load the catalog
+    // filtered to just those — keeps a multi-GB historical index bounded in
+    // memory (mirrors the annotation path's golden-PID filter).
+    keywords.forEach(kw => {
+      [kw.product_ids, kw.re_product_ids, kw.prev_re_ids, kw.new_iteration_ids,
+       kw.staging_ids, kw.tp_ids, kw.fp_ids]
+        .forEach(arr => (arr || []).forEach(p => neededPids.add(toStr(p))));
+    });
+    await loadCatalog();
 
     // 4. Cross-reference warnings
     const allNeeded = new Set();

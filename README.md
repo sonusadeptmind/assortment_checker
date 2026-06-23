@@ -36,6 +36,23 @@ To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pa
 
 ---
 
+## Product liveness filter (both modes)
+
+When you load a folder that contains a historical index, the dashboard asks **"Keep only live products?"** before it builds the index:
+
+- **Yes — live only** — only records whose `product_liveness` / `liveness` is `true` are kept; dead products and variants are dropped. The load notification reports how many were dropped.
+- **No — use full index** — the full historical index is used unchanged.
+
+The prompt appears once per load, is decided fresh every time (it is **not** remembered), and applies to both the annotation and iteration/catalog load paths. It is independent of the 90-day recency filter above — both can apply to the same load.
+
+---
+
+## Large historical indexes are streamed
+
+Historical-index files are read as a **stream** and parsed line by line — never loaded into memory as a single string — so multi-gigabyte indexes load without hitting the browser's ~512 MB string-size limit. Gzipped indexes (`.jsonl.gz`) are decompressed on the fly. In iteration / Tranche mode the catalog is additionally filtered to **only the product IDs referenced by `dataset.csv`** (and `new_iteration.xlsx`), so memory stays bounded regardless of how large the catalog is.
+
+---
+
 # What We're Measuring
 
 Four metrics evaluate landing-page quality, and the QA grades you assign in this dashboard are the input signal for all of them.
@@ -108,6 +125,8 @@ For subsequent iterations, `product_index.json` + `product_dumps.json` (generate
 | `manual_qa_status` | optional | `TRUE` / `FALSE` |
 
 PID lists accept `pid1|pid2|pid3`, `pid1,pid2,pid3`, or `['pid1','pid2']` format.
+
+> **Missing required columns are tolerated.** If `keyword`, `prod_ids`, or `results_editor_re` is absent from the header, the column is added at load time with empty values and a warning notification is shown — the file still loads (the affected fields come through blank) instead of failing. Note that column names must match exactly: a column such as `product_ids` is **not** auto-mapped to `prod_ids`; it will load as empty.
 
 ## catalog.jsonl Format
 
@@ -520,8 +539,12 @@ assortment_checker/
     ├── test_scripts.py
     ├── test_filters.js
     ├── test_metrics.js
+    ├── test_coercion.js
+    ├── test_cache_key.js          # IndexedDB index cache key (incl. live-only flag)
+    ├── test_live_only_filter.js   # "keep only live products" filter
     └── annotation/
         ├── test_annotation.js
+        ├── test_add_products.js
         ├── test_recency_filter.js
         ├── golden_dataset_labelled_desc_test.csv
         ├── gap_historical_index.jsonl
