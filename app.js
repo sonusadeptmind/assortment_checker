@@ -769,7 +769,7 @@ function _idbOpen() {
  *  date-relative, so a key valid today must miss tomorrow), and a hash of the
  *  golden-PID set (editing the CSV must invalidate the golden subset).  Pure —
  *  dayStamp is passed in so callers control time. */
-function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids, dayStamp) {
+function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids, dayStamp, liveOnly) {
   const pids = (allowedPids || []).slice().sort();
   let h = 5381;
   for (let i = 0; i < pids.length; i++) {
@@ -777,7 +777,10 @@ function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids,
     for (let j = 0; j < s.length; j++) h = ((h << 5) + h + s.charCodeAt(j)) | 0;
   }
   const pidSig = pids.length + '_' + (h >>> 0).toString(36);
-  return [retailer, fileName, size, lastModified, dayStamp, pidSig].join('::');
+  // live-only flag is part of the key — a "live only" load must never reuse a
+  // cached full-index entry (or vice-versa).
+  const liveSig = liveOnly ? 'live' : 'all';
+  return [retailer, fileName, size, lastModified, dayStamp, pidSig, liveSig].join('::');
 }
 
 async function idbGetIndex(key) {
@@ -848,7 +851,7 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
 
   // 2b. IndexedDB cache — a repeat load of this file/retailer/day skips the parse.
   const dayStamp = Math.floor(Date.now() / 86400000);
-  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp);
+  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp, keepLiveOnly);
   if (loadingMsg) loadingMsg.textContent = `Loading cached ${retailer} index…`;
   const cached = await idbGetIndex(cacheKey);
   if (cached && cached.productIndex && cached.fullIndex) {
@@ -879,8 +882,8 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
       : null;
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps } =
-      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
+    const { newIndex, newDumps, parsed, skipped, skippedStale, liveDropped, fullIndex, fullDumps } =
+      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, liveOnly: keepLiveOnly, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
@@ -906,9 +909,12 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       const staleNote = skippedStale > 0
         ? ` (${skippedStale} stale records dropped by 90-day filter)`
         : '';
+      const liveNote = (keepLiveOnly && liveDropped > 0)
+        ? ` Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped.`
+        : '';
       notifications.push({ type: 'info',
         text: `"${indexFile.name}": loaded ${loaded} of ${allowedPids.length} products `
-            + `(${fileSizeKB} KB streamed)${staleNote}.` });
+            + `(${fileSizeKB} KB streamed)${staleNote}.${liveNote}` });
     }
   } catch (e) {
     notifications.push({ type: 'error', text: `Failed to parse "${indexFile.name}": ${e.message}` });
@@ -932,7 +938,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
   const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
-  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
+  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0, liveDropped = 0;
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
@@ -967,7 +973,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     const isLive  = record.liveness !== false;
 
     if (inGolden) {
-      if (liveOnly && !isLive) { skipped++; }   // Add Products fallback: live only
+      if (liveOnly && !isLive) { skipped++; liveDropped++; }   // live-only: drop dead products
       else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
     }
     // The full live pool feeds Add Products without a second file read.
@@ -1003,7 +1009,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
 
   if (onProgress) onProgress(fullCount);   // land on the true total
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, liveDropped, fullIndex, fullDumps };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -1054,12 +1060,72 @@ async function switchAnnotationRetailer(retailer) {
   }
 }
 
+// LIVE-ONLY INDEX TOGGLE
+// When loading the historical index, the user is asked whether to keep only
+// live products. "Yes" → the built index contains only records whose liveness
+// is true (dead products/variants dropped). "No" → the full historical index
+// is used unchanged. Re-asked on every load (not persisted). Read by both the
+// annotation index path and the catalog/review path; only affects which
+// products land in the index (size + membership), never downstream behavior.
+let keepLiveOnly = false;
+
+/** Ask the user whether to keep only live products. Returns Promise<boolean>.
+ *  Builds a small modal reusing existing modal CSS; resolves on choice and
+ *  removes itself. Falls back to `false` (keep all) if the DOM is unavailable. */
+function confirmKeepLiveOnly() {
+  return new Promise(resolve => {
+    if (typeof document === 'undefined' || !document.body) { resolve(false); return; }
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.style.display = 'flex';
+    backdrop.style.zIndex = '10000';   // above the loading overlay
+    backdrop.innerHTML = `
+      <div class="modal modal-sm" onclick="event.stopPropagation()">
+        <h3>Keep only live products?</h3>
+        <p>This historical index can include products that are no longer live.
+           Choose <strong>Yes</strong> to build the index from live products and
+           variants only (<code>liveness = true</code>), or <strong>No</strong>
+           to use the full historical index.</p>
+        <div class="modal-actions" style="justify-content:flex-end;gap:8px;margin-top:16px">
+          <button class="btn" data-choice="no">No — use full index</button>
+          <button class="btn btn-primary" data-choice="yes">Yes — live only</button>
+        </div>
+      </div>`;
+
+    let done = false;
+    const finish = val => {
+      if (done) return;
+      done = true;
+      backdrop.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    };
+    const onKey = e => { if (e.key === 'Escape') finish(false); };
+
+    backdrop.addEventListener('click', () => finish(false));   // click-away = No
+    backdrop.querySelector('[data-choice="yes"]').addEventListener('click', () => finish(true));
+    backdrop.querySelector('[data-choice="no"]').addEventListener('click', () => finish(false));
+    document.addEventListener('keydown', onKey);
+
+    document.body.appendChild(backdrop);
+  });
+}
+
 async function handleFolderLoad(dirHandle) {
   // Collect all flat files from the directory handle
   const files = [];
   for await (const [, entry] of dirHandle.entries()) {
     if (entry.kind === 'file') files.push(await entry.getFile());
   }
+
+  // Ask once per load whether to keep only live products, before the loading
+  // overlay goes up. Only prompt when there's actually an index to build from
+  // (a .jsonl/.jsonl.gz catalog or a pre-built product_index.json). Applies to
+  // both the annotation and catalog/review load paths below.
+  const hasIndexFile = files.some(f =>
+    f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz') || f.name === 'product_index.json');
+  keepLiveOnly = hasIndexFile ? await confirmKeepLiveOnly() : false;
 
   const overlay = document.getElementById('loadingOverlay');
   const loadingMsg = document.getElementById('loadingMsg');
@@ -1123,13 +1189,21 @@ async function handleFolderLoad(dirHandle) {
       // missing image_url, liveness as 0/1) — we collapse to one schema.
       const cleanIndex = {};
       let normSkipped = 0;
+      let liveDropped = 0;
       for (const [rawPid, rawProduct] of Object.entries(rawIndex)) {
         const pid = toStr(rawPid);
         if (!pid) { normSkipped++; continue; }
-        cleanIndex[pid] = normalizeProductRecord(rawProduct, pid);
+        const rec = normalizeProductRecord(rawProduct, pid);
+        if (keepLiveOnly && rec.liveness === false) { liveDropped++; continue; }   // live-only: drop dead products
+        cleanIndex[pid] = rec;
       }
       productIndex = cleanIndex;
       if (normSkipped) console.warn(`[Step 1] Skipped ${normSkipped} entries with empty product_id keys.`);
+      if (keepLiveOnly && liveDropped) {
+        console.log(`[Step 1] Live-only mode: dropped ${liveDropped} non-live products.`);
+        notifications.push({ type: 'info',
+          text: `Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped from the index.` });
+      }
       console.log(`[Step 1] product_index.json loaded — ${Object.keys(productIndex).length} products`);
 
       loadingMsg.textContent = 'Loading product dumps…';
@@ -1140,7 +1214,8 @@ async function handleFolderLoad(dirHandle) {
         const cleanDumps = {};
         for (const [rawPid, dump] of Object.entries(rawDumps)) {
           const pid = toStr(rawPid);
-          if (pid) cleanDumps[pid] = dump;
+          // In live-only mode keep dumps in sync with the filtered index.
+          if (pid && (!keepLiveOnly || productIndex[pid])) cleanDumps[pid] = dump;
         }
         productDumps = cleanDumps;
       } else {
@@ -1195,6 +1270,7 @@ async function handleFolderLoad(dirHandle) {
       let parsed = 0;
       let skipped = 0;
       let skippedStale = 0;
+      let liveDropped = 0;
       const parseErrors = [];
 
       const safeList = (v) => {
@@ -1238,7 +1314,9 @@ async function handleFolderLoad(dirHandle) {
         // (numeric titles, missing fields, nested product_dump, image arrays)
         // collapses to the same predictable schema.
         // product_liveness defaults to true for products not in catalog (mirrors evaluate_iteration.py).
-        newIndex[pid] = normalizeProductRecord(doc, pid);
+        const rec = normalizeProductRecord(doc, pid);
+        if (keepLiveOnly && rec.liveness === false) { liveDropped++; continue; }   // live-only: drop dead products
+        newIndex[pid] = rec;
         newDumps[pid] = dumpForPid || doc;
         parsed++;
 
@@ -1264,11 +1342,17 @@ async function handleFolderLoad(dirHandle) {
       }
       console.log(`[Step 1] Parsed "${jsonlFile.name}": ${parsed} products, ${skipped} lines skipped, ${skippedStale} filtered by 90-day recency`);
 
+      if (keepLiveOnly && liveDropped > 0) {
+        console.log(`[Step 1] Live-only mode: dropped ${liveDropped} non-live products from "${jsonlFile.name}".`);
+      }
       productIndex = newIndex;
       productDumps = newDumps;
       const staleNote = skippedStale > 0 ? ` (${skippedStale} stale records dropped by 90-day filter)` : '';
+      const liveNote = (keepLiveOnly && liveDropped > 0)
+        ? ` Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped.`
+        : '';
       notifications.push({ type: 'info',
-        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.` });
+        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.${liveNote}` });
     }
 
     // 2. dataset.csv (required)
