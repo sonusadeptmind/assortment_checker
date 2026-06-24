@@ -311,8 +311,8 @@ function renderAddProductsGrid() {
     const p = index[pid] || {};
     const isSel = addDialogSelected.has(pid);
     const price = p.price ? `$${Number(p.price).toFixed(2)}` : '';
-    return `<div class="add-card ${isSel ? 'selected' : ''}" data-pid="${pid}" onclick="toggleAddSelect('${pid}')">
-      <div class="add-card-check">
+    return `<div class="add-card ${isSel ? 'selected' : ''}" data-pid="${pid}" onclick="openModal('${pid}', {viewOnly: true})">
+      <div class="add-card-check" onclick="event.stopPropagation()">
         <input type="checkbox" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleAddSelect('${pid}')">
       </div>
       <div class="add-card-header">

@@ -295,18 +295,24 @@ function updateGridCount() {
 function updateRetailerProgress() {
   const wrap = document.getElementById('retailerProgressWrap');
   if (!wrap) return;
-  if (appMode !== 'annotation' || !currentUser || !keywords.length) {
+  if (!keywords.length || (appMode === 'annotation' && !currentUser)) {
     wrap.style.display = 'none'; return;
   }
 
-  // A keyword is "done" when every product in it has been graded by the active user
+  // A keyword is "done" when every product in it has been labeled — graded by
+  // the active user in annotation mode, approved/disapproved in iteration mode.
   let doneKws = 0;
   const totalKws = keywords.length;
   keywords.forEach(kw => {
     const pids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
-    if (pids.length > 0 && annCountGrades(currentUser, kw.keyword, pids).labeled === pids.length) {
-      doneKws++;
-    }
+    if (pids.length === 0) return;
+    const labeled = appMode === 'annotation'
+      ? annCountGrades(currentUser, kw.keyword, pids).labeled
+      : pids.filter(pid => {
+          const key = `${kw.keyword}::${pid}`;
+          return approvals[key] || disapprovals[key];
+        }).length;
+    if (labeled === pids.length) doneKws++;
   });
 
   const pct     = totalKws > 0 ? (doneKws / totalKws * 100).toFixed(1) : 0;
@@ -2097,10 +2103,15 @@ function requireUser() {
 
 // DETAIL MODAL
 
-function openModal(pid) {
+function openModal(pid, opts = {}) {
   modalPid = pid;
-  const p = productIndex[pid] || {};
-  const dump = productDumps[pid] || {};
+  const viewOnly = opts && opts.viewOnly === true;
+  // Fall back to the Add Products live sources: in annotation mode a candidate
+  // browsed in the Add dialog isn't in productIndex/productDumps until it's added.
+  const p = productIndex[pid]
+    || (typeof getAddSourceIndex === 'function' ? getAddSourceIndex()[pid] : null) || {};
+  const dump = productDumps[pid]
+    || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null) || {};
   const key = `${activeKeyword.keyword}::${pid}`;
   const isDisapproved = !!disapprovals[key];
 
@@ -2145,14 +2156,24 @@ function openModal(pid) {
   document.getElementById('confirmDisapproval').disabled   = true;
   document.getElementById('confirmDisapproval').textContent = 'Confirm Disapproval';
 
-  if (appMode === 'annotation') {
-    annSetupModal(pid, activeKeyword.keyword, currentUser);
-  } else {
-    // Iteration mode button states
-    document.getElementById('modalDisapproveBtn').style.display = isDisapproved ? 'none' : '';
+  const actionsEl = document.querySelector('#modalBackdrop .modal-actions');
+  if (viewOnly) {
+    // Opened from the Add Products dialog — the product isn't in the keyword's
+    // review set yet, so suppress the grade/disapprove controls and show only
+    // the product detail + dump.
+    if (actionsEl) actionsEl.style.display = 'none';
     document.getElementById('reasonForm').style.display = 'none';
-    const gradeWrap = document.getElementById('gradeButtonsWrap');
-    if (gradeWrap) gradeWrap.style.display = 'none';
+  } else {
+    if (actionsEl) actionsEl.style.display = '';
+    if (appMode === 'annotation') {
+      annSetupModal(pid, activeKeyword.keyword, currentUser);
+    } else {
+      // Iteration mode button states
+      document.getElementById('modalDisapproveBtn').style.display = isDisapproved ? 'none' : '';
+      document.getElementById('reasonForm').style.display = 'none';
+      const gradeWrap = document.getElementById('gradeButtonsWrap');
+      if (gradeWrap) gradeWrap.style.display = 'none';
+    }
   }
 
   document.getElementById('modalBackdrop').classList.add('active');
