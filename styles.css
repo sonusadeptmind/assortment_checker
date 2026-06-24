@@ -964,6 +964,10 @@ body {
   display: flex;
 }
 
+/* The product detail modal can be opened on top of the Add Products dialog,
+   so keep it above other modal backdrops. */
+#modalBackdrop { z-index: 1100; }
+
 .modal {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
