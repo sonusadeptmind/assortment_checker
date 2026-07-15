@@ -178,6 +178,24 @@ r = sandbox.normalizeProductRecord({ product_dump: { title: 'wrapped', images: [
 ok('dump fallback for title',   r.title === 'wrapped');
 ok('image_url picks valid url', r.image_url === 'https://a/x.jpg');
 
+// ── material/attribute sourcing (Issues 1 & 5) ──
+console.log('\n── material sourced from FABRIC + dump fallbacks ──');
+// Feed stores fabric under top-level FABRIC (not MATERIAL) → cotton blends must
+// still populate `material` so "Material contains cotton" matches them.
+r = sandbox.normalizeProductRecord({ FABRIC: ['COTTON', 'POLYESTER'] }, 'p1');
+ok('material from top-level FABRIC', r.material === 'COTTON, POLYESTER');
+// FABRIC nested inside the product_dump (as seen in the real Old Navy feed).
+r = sandbox.normalizeProductRecord({ product_dump: { FABRIC: ['COTTON', 'SPANDEX'] } }, 'p1');
+ok('material from dump FABRIC',      r.material === 'COTTON, SPANDEX');
+// Explicit MATERIAL still wins over FABRIC.
+r = sandbox.normalizeProductRecord({ MATERIAL: 'wool', FABRIC: ['cotton'] }, 'p1');
+ok('MATERIAL preferred over FABRIC', r.material === 'wool');
+// color / product_type / occasion fall back to the dump when top-level is absent.
+r = sandbox.normalizeProductRecord({ product_dump: { colors: ['BLUE', 'RED'], product_type: 'apparel', occasion: ['casual'] } }, 'p1');
+ok('color from dump',        r.color === 'BLUE, RED');
+ok('product_type from dump', r.product_type === 'apparel');
+ok('occasion from dump',     r.occasion === 'casual');
+
 // ── Final tally ──
 console.log('\n════════════════════════════════════════════════════════════');
 console.log(`  Tests passed: ${pass}`);

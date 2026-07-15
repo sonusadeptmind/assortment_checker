@@ -320,8 +320,12 @@
         <select id="addFilterValueSelect" class="filter-select" onchange="onAddFilterChange()" style="display:none">
           <option value="">Select value…</option>
         </select>
+        <button class="btn btn-sm btn-outline" id="addFilterAddBtn" onclick="addProductsCommitFilter()" title="Add this as an extra filter (all filters must match)">＋ Add filter</button>
       </div>
     </div>
+
+    <!-- Committed filter pills (multi-attribute queries) -->
+    <div id="addProductsFilterPills" class="filter-pills-row" style="display:none"></div>
 
     <!-- Bulk select row -->
     <div class="add-products-bulk-row">

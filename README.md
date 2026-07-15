@@ -141,11 +141,13 @@ One JSON object per line. Required fields: `product_id` (or `id`) and `updated_a
 | `brand` | Brand name |
 | `images` / `image_url` | Image URLs |
 | `colors` / `COLOR` | Color values |
-| `MATERIAL` | Material / fabric |
+| `MATERIAL` / `FABRIC` | Material / fabric (either key is accepted) |
 | `product_type` | Product type |
 | `PRICE` | Price |
 | `OCCASION` | Occasion tags |
 | `product_dump` | Full raw vendor data (shown in detail view) |
+
+Color, material, product type, and occasion are read from the top-level keys above and, when absent there, fall back to the same keys inside `product_dump` — so attribute filters still populate when a feed nests these values in the raw vendor data.
 
 ## new_iteration.xlsx Format
 
@@ -393,6 +395,7 @@ Three bulk buttons in place of two:
 The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword (defaulting to **grade 1 / Relevant** in annotation mode, **Approved** in iteration mode) — useful when a relevant product was missing from the original assortment.
 
 - **Search** matches a curated field set (title, brand, type, color, material, occasion, category). For a deep search across the full product JSON, switch the filter field to **Product Dump**.
+- **Multiple filters** — click **＋ Add filter** to commit the current field/operator/value as a pill and stack another (e.g. `Dump = "slim fit"` **and** `Dump = "long sleeve"`). All committed pills plus the in-progress control must match. Remove a pill with its **×** to re-run the search.
 - Only live products are shown; anything already tied to the keyword is excluded.
 - Added products are written back on CSV export (a golden row is appended so the addition survives a round-trip).
 

@@ -16,7 +16,14 @@ let addDialogDumpCache   = {};   // pid → lowercased dump JSON, built lazily f
 let addDialogSelected    = new Set();
 let addDialogCandidates  = [];   // current filtered candidate pids
 let addDialogPage        = 0;    // 0-indexed current page of the candidate list
+let addDialogFilters     = [];   // committed filter pills [{ field, operator, value, label }] — all AND-ed
 let _addSearchDebounce   = null;
+
+const ADD_FIELD_LABELS = {
+  product_dump: 'Dump', title: 'Title', description: 'Desc',
+  brand: 'Brand', color: 'Color', product_type: 'Type',
+  material: 'Material', occasion: 'Occasion',
+};
 
 const ADD_TEXT_FIELDS = new Set(['product_dump', 'title', 'description']);
 const ADD_PAGE_SIZE   = 32;      // candidates rendered per page (8 rows × 4 cols)
@@ -189,6 +196,8 @@ async function openAddProductsModal() {
   document.getElementById('addFilterField').value      = 'product_dump';
   document.getElementById('addFilterOperator').value   = 'contains';
   addDialogSelected.clear();
+  addDialogFilters = [];
+  renderAddFilterPills();
   updateAddConfirmBtn();
   addProductsPopulateFilterValues();
   backdrop.style.display = 'flex';
@@ -266,21 +275,73 @@ function onAddFilterChange() {
   _addSearchDebounce = setTimeout(addProductsApplyFilters, 0);
 }
 
-function addProductsApplyFilters() {
+/** Read the live (uncommitted) filter control, or null when it has no value. */
+function readAddFilterControl() {
   const field    = document.getElementById('addFilterField').value;
   const operator = document.getElementById('addFilterOperator').value;
-  const isText   = ADD_TEXT_FIELDS.has(field);
-  const value    = isText
+  const value    = ADD_TEXT_FIELDS.has(field)
     ? (document.getElementById('addFilterValueText').value  || '').trim()
     : (document.getElementById('addFilterValueSelect').value || '');
-  const search   = document.getElementById('addSearchInput').value || '';
+  return (field && value) ? { field, operator, value } : null;
+}
 
-  const filters  = (field && value) ? [{ field, operator, value }] : [];
+function addProductsApplyFilters() {
+  const search  = document.getElementById('addSearchInput').value || '';
+  const live    = readAddFilterControl();
+
+  // Committed pills AND the in-progress control all must match (multi-attribute).
+  const filters = [...addDialogFilters];
+  if (live) filters.push(live);
+
   addDialogCandidates = computeAddCandidates(
     getAddSourceIndex(), getAddDumpStr, keywordExistingPids(activeKeyword), filters, search
   );
   addDialogPage = 0;             // new result set → back to the first page
   renderAddProductsGrid();
+}
+
+/** Commit the current filter control as a pill so a second attribute can be
+ *  added (e.g. "slim fit" AND "long sleeve"), then reset the control. */
+function addProductsCommitFilter() {
+  const live = readAddFilterControl();
+  if (!live) { showToast('Choose a filter value first.', 'error'); return; }
+
+  const fLabel = ADD_FIELD_LABELS[live.field] || live.field;
+  const oLabel = live.operator === 'not_contains' ? '≠' : '=';
+  const label  = `${fLabel} ${oLabel} "${live.value}"`;
+
+  // Skip exact duplicates; otherwise keep (two product_dump terms are valid).
+  const dup = addDialogFilters.some(f =>
+    f.field === live.field && f.operator === live.operator && f.value === live.value);
+  if (!dup) addDialogFilters.push({ ...live, label });
+
+  // Reset the value control for the next attribute (keep field/operator).
+  document.getElementById('addFilterValueText').value   = '';
+  document.getElementById('addFilterValueSelect').value = '';
+
+  renderAddFilterPills();
+  onAddFilterChange();
+}
+
+/** Remove one committed filter pill by index and re-run the search. */
+function addProductsRemoveFilter(idx) {
+  addDialogFilters.splice(idx, 1);
+  renderAddFilterPills();
+  onAddFilterChange();
+}
+
+/** Render the committed filter pills below the controls. Hidden when empty. */
+function renderAddFilterPills() {
+  const row = document.getElementById('addProductsFilterPills');
+  if (!row) return;
+  if (addDialogFilters.length === 0) { row.style.display = 'none'; row.innerHTML = ''; return; }
+  row.style.display = 'flex';
+  row.innerHTML = addDialogFilters.map((f, idx) =>
+    `<span class="filter-pill">
+       <span class="filter-pill-label">${escapeHtml(f.label)}</span>
+       <button class="filter-pill-remove" onclick="addProductsRemoveFilter(${idx})" title="Remove filter">×</button>
+     </span>`
+  ).join('');
 }
 
 function renderAddProductsGrid() {

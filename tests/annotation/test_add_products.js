@@ -189,6 +189,31 @@ eq('search "trail" AND Footwear → p2',
 // No matches
 eq('no match → empty', computeAddCandidates(INDEX, noDumps, [], [{field:'brand',operator:'contains',value:'Nike'}], ''), []);
 
+// Multiple filters AND together (Issue 2: multi-attribute queries like
+// "slim fit long sleeve shirt"). Two product_dump terms must BOTH match.
+{
+  const IDX = {
+    a: withSearchText({ product_id:'a', title:'Slim Fit Long Sleeve Shirt', liveness:true }),
+    b: withSearchText({ product_id:'b', title:'Slim Fit Shirt',             liveness:true }),
+  };
+  const D = { a:'{"desc":"slim fit long sleeve"}', b:'{"desc":"slim fit"}' };
+  const get = pid => (D[pid] || '').toLowerCase();
+  eq('two dump filters AND → only a',
+    computeAddCandidates(IDX, get, [], [
+      { field:'product_dump', operator:'contains', value:'slim fit' },
+      { field:'product_dump', operator:'contains', value:'long sleeve' },
+    ], '').sort(),
+    ['a']);
+}
+
+// A categorical filter AND a free-text filter across different fields.
+eq('Footwear AND color Blue → p2',
+  computeAddCandidates(INDEX, noDumps, [], [
+    { field:'product_type', operator:'contains', value:'Footwear' },
+    { field:'color',        operator:'contains', value:'Blue' },
+  ], '').sort(),
+  ['p2']);
+
 //  keywordExistingPids — excludes everything already tied to the keyword
 console.log('── keywordExistingPids ───────────────────────────────────');
 eq('union of all id sets, deduped',
