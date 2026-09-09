@@ -176,6 +176,23 @@ function getBasePids() {
     ? activeKeyword.re_product_ids : activeKeyword.product_ids;
 }
 
+/** Out-of-stock test — mirrors computeKeywordMetrics: a product is OOS only
+ *  when the catalog knows it and marks it dead.  PIDs absent from the catalog
+ *  default to in-stock. */
+function isPidOutOfStock(pid, index) {
+  const entry = (index || productIndex)[pid];
+  return entry !== undefined && entry.liveness === false;
+}
+
+/** The PIDs that count toward a keyword's completion.  OOS products cannot be
+ *  judged (there is no live info to grade them on), so they are dropped from
+ *  BOTH the numerator and the denominator of every progress/done calculation —
+ *  otherwise a keyword whose only unlabeled leftovers are OOS never reaches
+ *  100% and never counts as a checked keyword. */
+function progressPids(pids, index) {
+  return (pids || []).filter(pid => !isPidOutOfStock(pid, index));
+}
+
 /** Strict whole-word match (word-boundary regex).
  *  "thin" matches "thin" but NOT "things", "thinking", "unthinkable". */
 function strictContains(haystack, needle) {
@@ -304,8 +321,11 @@ function updateRetailerProgress() {
   let doneKws = 0;
   const totalKws = keywords.length;
   keywords.forEach(kw => {
-    const pids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
-    if (pids.length === 0) return;
+    const basePids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
+    if (basePids.length === 0) return;
+    // OOS products are unjudgeable — they never block a keyword from counting.
+    const pids = progressPids(basePids);
+    if (pids.length === 0) { doneKws++; return; }   // every product is OOS → nothing left to check
     const labeled = appMode === 'annotation'
       ? annCountGrades(currentUser, kw.keyword, pids).labeled
       : pids.filter(pid => {
@@ -1622,20 +1642,24 @@ function renderKeywordList() {
         : qaDoneKeywords.has(kw.keyword);
 
       const basePids = (kw.re_product_ids && kw.re_product_ids.length > 0) ? kw.re_product_ids : kw.product_ids;
-      const total = basePids.length;
+      // OOS products can't be checked, so they are excluded from the bar.
+      const scoredPids = progressPids(basePids);
+      const total = scoredPids.length;
+      const oosCount = basePids.length - total;
+      const oosNote = oosCount > 0 ? ` (${oosCount} OOS excluded)` : '';
 
       // Progress bar and badge differ by mode
       let progressPct, badgeText, titleText;
       if (appMode === 'annotation') {
-        const c = annCountGrades(currentUser, kw.keyword, basePids);
+        const c = annCountGrades(currentUser, kw.keyword, scoredPids);
         progressPct = total > 0 ? (c.labeled / total * 100).toFixed(1) : 0;
         badgeText   = isDone ? '✓' : annRenderSidebarBadge(kw, currentUser);
-        titleText   = `${kw.keyword} — ${c.labeled} labeled / ${total} total`;
+        titleText   = `${kw.keyword} — ${c.labeled} labeled / ${total} in stock${oosNote}`;
       } else {
-        const approvedCount = basePids.filter(pid => approvals[`${kw.keyword}::${pid}`]).length;
+        const approvedCount = scoredPids.filter(pid => approvals[`${kw.keyword}::${pid}`]).length;
         progressPct = total > 0 ? (approvedCount / total * 100).toFixed(1) : 0;
         badgeText   = isDone ? '✓' : kw.total;
-        titleText   = `${kw.keyword} — ${approvedCount} approved / ${total} total`;
+        titleText   = `${kw.keyword} — ${approvedCount} approved / ${total} in stock${oosNote}`;
       }
 
       return `<div class="keyword-item ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}"
@@ -1972,6 +1996,19 @@ function clearFilter() {
   renderGrid();
 }
 
+/** Post-marking refresh.  A filter stays applied to the keyword until the
+ *  reviewer clears it explicitly, so marking products must NOT call
+ *  clearFilter() — it only drops the now-stale selection and re-renders the
+ *  grid against the new labels. */
+function refreshAfterMarking() {
+  selectedPids.clear();
+  recomputeFilteredPids();
+  renderFilterPills();
+  updateFiltersBadge();
+  updateGridCount();
+  renderGrid();
+}
+
 /* Reset filter controls to default state: product_dump + contains + empty text input */
 function initFilterDefaults() {
   document.getElementById('filterField').value    = 'product_dump';
@@ -2103,6 +2140,16 @@ function requireUser() {
 
 // DETAIL MODAL
 
+/** Resolve a product's raw dump for the detail modal.  Falls back to the Add
+ *  Products live sources: a candidate browsed from the Add dialog is not in
+ *  productDumps until it is actually added, and without this fallback the
+ *  payload view blanks out the moment it is re-read (e.g. on dump search). */
+function resolveProductDump(pid) {
+  return productDumps[pid]
+    || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null)
+    || {};
+}
+
 function openModal(pid, opts = {}) {
   modalPid = pid;
   const viewOnly = opts && opts.viewOnly === true;
@@ -2110,8 +2157,7 @@ function openModal(pid, opts = {}) {
   // browsed in the Add dialog isn't in productIndex/productDumps until it's added.
   const p = productIndex[pid]
     || (typeof getAddSourceIndex === 'function' ? getAddSourceIndex()[pid] : null) || {};
-  const dump = productDumps[pid]
-    || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null) || {};
+  const dump = resolveProductDump(pid);
   const key = `${activeKeyword.keyword}::${pid}`;
   const isDisapproved = !!disapprovals[key];
 
@@ -2196,8 +2242,7 @@ function searchProductDump() {
   const countEl = document.getElementById('dumpSearchCount');
   const prevBtn = document.getElementById('dumpNavPrev');
   const nextBtn = document.getElementById('dumpNavNext');
-  const dump = productDumps[modalPid] || {};
-  const dumpStr = JSON.stringify(dump, null, 2);
+  const dumpStr = JSON.stringify(resolveProductDump(modalPid), null, 2);
 
   if (!query) {
     pre.innerHTML = '';
@@ -2404,7 +2449,7 @@ function confirmBulkDisapproval() {
   });
 
   closeBulkModal();
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   updateQaDoneUI();
   renderKeywordList();
@@ -2426,7 +2471,7 @@ function bulkApprove() {
     };
     recordLabelChange(activeKeyword.keyword, pid, 'TP');
   });
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   updateQaDoneUI();
   renderKeywordList();

@@ -163,7 +163,7 @@ function bulkGradeAction(grade) {
   pids.forEach(pid => {
     annSetGrade(currentUser, activeKeyword.keyword, pid, grade);
   });
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   annUpdateQaDoneUI(currentUser);
   renderKeywordList();
@@ -210,7 +210,7 @@ function annConfirmBulkGrade0() {
 
   _annBulkGrade0Pending = null;
   closeBulkModal();
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   annUpdateQaDoneUI(currentUser);
   renderKeywordList();

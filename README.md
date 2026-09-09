@@ -370,6 +370,12 @@ If `{retailer}_historical_index.jsonl` is not in the folder, a warning notificat
 
 Per-keyword counts in the sidebar show as `12 · 4/6/2` (total · 0-count / 1-count / 2-count for the active user).
 
+### Completion progress and out-of-stock products
+
+The bar under each keyword — and the retailer-level `N / M keywords fully QA'd` bar — measures completion over **in-stock products only**. A product is out of stock when the catalog carries it with `product_liveness = false`; products absent from the catalog count as in-stock (same rule the evaluation script uses).
+
+OOS products can't be judged — there is no live info to grade them on — so they are excluded from both sides of the ratio. A keyword whose only ungraded leftovers are OOS reaches 100%, gets its ✓, and counts toward the keywords-checked total. The keyword tooltip and the QA bar spell the exclusion out (`2 labeled / 2 in stock (1 OOS excluded)`), and a keyword whose products are *all* OOS counts as checked because nothing is left to review. Grading an OOS product anyway is harmless — it simply doesn't move the bar.
+
 Topbar metrics in annotation mode:
 
 | Pill | Meaning |
@@ -388,15 +394,17 @@ Three bulk buttons in place of two:
 
 - **Bulk-0** opens the existing bulk reason modal.
 - **Bulk-1 / Bulk-2** apply immediately.
-- Filters reset after every bulk action (same behavior as iteration mode).
+- Filters stay applied after a bulk action — they persist for the keyword until you press **✕ Clear** (same behavior as iteration mode). Only the product selection is dropped.
 
 ## Add Products
 
-The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword (defaulting to **grade 1 / Relevant** in annotation mode, **Approved** in iteration mode) — useful when a relevant product was missing from the original assortment.
+The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword — useful when a relevant product was missing from the original assortment.
 
 - **Search** matches a curated field set (title, brand, type, color, material, occasion, category). For a deep search across the full product JSON, switch the filter field to **Product Dump**.
 - **Multiple filters** — click **＋ Add filter** to commit the current field/operator/value as a pill and stack another (e.g. `Dump = "slim fit"` **and** `Dump = "long sleeve"`). All committed pills plus the in-progress control must match. Remove a pill with its **×** to re-run the search.
+- **Grade to apply** — in annotation mode an **Add as:** row lets you add the selection as **grade 1 (Relevant)** or **grade 2 (Perfect)**; it resets to grade 1 each time the dialog opens, and the confirm button shows the grade you're about to apply. Iteration mode has no grades, so the row is hidden and products are added as **Approved**.
 - Only live products are shown; anything already tied to the keyword is excluded.
+- Clicking a candidate card opens the read-only detail view, including its full product payload. Searching inside that payload keeps working for products that have not been added yet.
 - Added products are written back on CSV export (a golden row is appended so the addition survives a round-trip).
 
 See [Performance → Annotation-mode index loading & Add Products](#annotation-mode-index-loading--add-products) for the single-pass build, IndexedDB cache, and progress loaders behind this.

@@ -108,11 +108,14 @@ function annSetMode(mode) {
  *  Done state is implicit: keyword is done when all its products have grades. */
 function annUpdateQaDoneUI(user) {
   if (!activeKeyword) return;
-  const pids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
+  const basePids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
     ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  // OOS products are excluded from the count — they can't be graded.
+  const pids = typeof progressPids === 'function' ? progressPids(basePids) : basePids;
+  const oosCount = basePids.length - pids.length;
 
   const c      = annCountGrades(user || '', activeKeyword.keyword, pids);
-  const isDone = c.total > 0 && c.labeled === c.total;
+  const isDone = annIsKeywordDone(activeKeyword, user);
 
   // Sync qaDoneKeywords (used by sidebar progress bar and save)
   if (isDone) qaDoneKeywords.add(activeKeyword.keyword);
@@ -128,7 +131,8 @@ function annUpdateQaDoneUI(user) {
   const revertBtn= document.getElementById('qaRevertBtn');
 
   if (kwLabel)   kwLabel.textContent  = activeKeyword.keyword;
-  if (kwStats)   kwStats.textContent  = `${c.labeled} / ${c.total} labeled`;
+  if (kwStats)   kwStats.textContent  = `${c.labeled} / ${c.total} labeled`
+    + (oosCount > 0 ? ` · ${oosCount} OOS excluded` : '');
   if (markBtn)   markBtn.style.display   = 'none';  // not needed: done is implicit
   if (revertBtn) revertBtn.style.display = 'none';
 }

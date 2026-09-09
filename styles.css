@@ -1932,6 +1932,13 @@ mark.dump-highlight-active {
 .add-products-title span { color: var(--accent-hover); }
 .add-products-subtitle { margin: 0 0 14px; color: var(--text-secondary); font-size: 13px; }
 
+.add-products-grade {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin: 0 0 14px; font-size: 13px; color: var(--text-secondary);
+}
+.add-products-grade-label { font-weight: 600; color: var(--text-primary); }
+.add-products-grade-opt { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+
 .add-products-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .add-products-search { flex: 1; min-width: 220px; }
 .add-products-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
