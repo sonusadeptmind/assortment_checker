@@ -150,6 +150,15 @@ assert('onAddGradeChange reads the radio',             /input\[name="addGrade"\]
 
 const html = fs.readFileSync(path.join(ROOT, 'assortment_checker.html'), 'utf-8');
 assert('dialog offers a grade 1 radio', /name="addGrade" value="1"/.test(html));
+// Grade names read as "1 (Relevant)", matching annotation/bulk.js — no
+// decorative em dash between the number and the name.
+assert('add-dialog grade names use parentheses', /Grade 1 \(Relevant\)/.test(html));
+assert('add-dialog grade 2 name uses parentheses', /Grade 2 \(Perfect\)/.test(html));
+const renderSrc = fs.readFileSync(path.join(ROOT, 'annotation', 'render.js'), 'utf-8');
+[['html', html], ['app.js', appSrc], ['render.js', renderSrc]].forEach(([label, src]) => {
+  assert(`no em-dash grade labels left in ${label}`,
+    !/[012]\s+—\s+(Not relevant|Relevant|Perfect)/.test(src));
+});
 assert('dialog offers a grade 2 radio', /name="addGrade" value="2"/.test(html));
 assert('grade 1 is preselected',        /name="addGrade" value="1" checked/.test(html));
 

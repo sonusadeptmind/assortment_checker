@@ -1360,7 +1360,7 @@ async function handleFolderLoad(dirHandle) {
         );
       }
       if (!parsed) {
-        console.warn(`[Step 1] "${jsonlFile.name}": ${seenValid.toLocaleString()} recent products scanned, but none matched the ${neededPids.size} dataset PIDs — all cards will show "Product not in catalog".`);
+        console.warn(`[Step 1] "${jsonlFile.name}": ${seenValid.toLocaleString()} recent products scanned, but none matched the ${neededPids.size} dataset PIDs, so no card will have product details.`);
       }
 
       if (skipped > 0) {
@@ -1875,9 +1875,9 @@ function populateFilterValues() {
     textEl.style.display = 'none'; selectEl.style.display = '';
     selectEl.innerHTML = `
       <option value="">Select grade…</option>
-      <option value="0">0 — Not relevant</option>
-      <option value="1">1 — Relevant</option>
-      <option value="2">2 — Perfect</option>
+      <option value="0">0 (Not relevant)</option>
+      <option value="1">1 (Relevant)</option>
+      <option value="2">2 (Perfect)</option>
       <option value="unlabeled">Unlabeled</option>`;
   } else {
     textEl.style.display = 'none'; selectEl.style.display = '';
