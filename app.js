@@ -765,11 +765,16 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
  *  and naming drift.  Shared by the annotation loader and the Add Products
  *  full-live-index loader (add_products.js). */
 function findHistoricalIndexFile(files, retailer) {
-  const jsonlFiles = files.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
+  // A zero-byte file can never be the index.  Folders often carry an empty
+  // stub next to the real index (gap.jsonl beside gap_gap.jsonl.gz) and both
+  // match the retailer, so without this the stub wins on enumeration order
+  // and every product id looks absent from the catalog.
+  const usable     = files.filter(f => f.size > 0);
+  const jsonlFiles = usable.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
   const exact      = `${retailer}_historical_index.jsonl`;
   return (
-    files.find(f => f.name === exact) ||
-    files.find(f => f.name.toLowerCase() === exact) ||
+    usable.find(f => f.name === exact) ||
+    usable.find(f => f.name.toLowerCase() === exact) ||
     jsonlFiles.find(f => f.name.toLowerCase().includes(retailer)) ||
     (jsonlFiles.length === 1 ? jsonlFiles[0] : null)
   );
