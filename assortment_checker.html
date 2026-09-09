@@ -135,7 +135,7 @@
         <span id="gridProductCount" class="grid-count-chip" style="display:none"></span>
         <button id="showLabelsBtn" class="btn btn-sm toggle-pill" onclick="toggleShowLabels()" title="Show products already labeled in the current review set">👁 Show Labeled</button>
         <button id="showPriorBtn" class="btn btn-sm toggle-pill" onclick="toggleShowPrior()" title="Show products labeled in prior iterations that are not in the current review set">🕑 Prior Iterations</button>
-        <button id="addProductsBtn" class="btn btn-sm btn-primary add-products-btn" onclick="openAddProductsModal()" title="Search live products and add them to this keyword (default grade 1 / approved)">➕ Add Products</button>
+        <button id="addProductsBtn" class="btn btn-sm btn-primary add-products-btn" onclick="openAddProductsModal()" title="Search live products and add them to this keyword (choose grade 1 or 2 / approved)">➕ Add Products</button>
       </div>
       <!-- Active filter pills row -->
       <div class="filter-pills-row" id="filterPillsRow" style="display:none"></div>
@@ -156,9 +156,9 @@
         <span class="bulk-row-label">Bulk grade:</span>
         <button class="btn btn-sm btn-outline" id="annSelectAllBtn" onclick="selectAllProducts()" style="display:none">☑ Select All</button>
         <button class="btn btn-sm btn-outline" id="annDeselectAllBtn" onclick="deselectAllProducts()" style="display:none">☐ Deselect All</button>
-        <button class="btn btn-sm btn-grade-0" onclick="bulkGradeAction(0)" title="Grade selected/filtered products as 0">0 — Not relevant</button>
-        <button class="btn btn-sm btn-grade-1" onclick="bulkGradeAction(1)" title="Grade selected/filtered products as 1">1 — Relevant</button>
-        <button class="btn btn-sm btn-grade-2" onclick="bulkGradeAction(2)" title="Grade selected/filtered products as 2">2 — Perfect</button>
+        <button class="btn btn-sm btn-grade-0" onclick="bulkGradeAction(0)" title="Grade selected/filtered products as 0">0 (Not relevant)</button>
+        <button class="btn btn-sm btn-grade-1" onclick="bulkGradeAction(1)" title="Grade selected/filtered products as 1">1 (Relevant)</button>
+        <button class="btn btn-sm btn-grade-2" onclick="bulkGradeAction(2)" title="Grade selected/filtered products as 2">2 (Perfect)</button>
       </div>
     </div>
 
@@ -208,9 +208,9 @@
           <button class="btn btn-danger" id="modalDisapproveBtn" onclick="disapproveFromModal()">🚫 Disapprove</button>
           <!-- Annotation mode grade buttons (hidden in iteration mode) -->
           <div id="gradeButtonsWrap" style="display:none; gap:8px; flex-wrap:wrap">
-            <button class="btn btn-grade-0" id="gradeBtn0" onclick="gradeFromModal(0)">0 — Not relevant</button>
-            <button class="btn btn-grade-1" id="gradeBtn1" onclick="gradeFromModal(1)">1 — Relevant</button>
-            <button class="btn btn-grade-2" id="gradeBtn2" onclick="gradeFromModal(2)">2 — Perfect</button>
+            <button class="btn btn-grade-0" id="gradeBtn0" onclick="gradeFromModal(0)">0 (Not relevant)</button>
+            <button class="btn btn-grade-1" id="gradeBtn1" onclick="gradeFromModal(1)">1 (Relevant)</button>
+            <button class="btn btn-grade-2" id="gradeBtn2" onclick="gradeFromModal(2)">2 (Perfect)</button>
           </div>
         </div>
         <!-- DISAPPROVAL REASON FORM -->
@@ -295,7 +295,18 @@
   <div class="modal add-products-modal" onclick="event.stopPropagation()">
     <button class="modal-close" onclick="closeAddProductsModal()">✕</button>
     <h3 class="add-products-title">➕ Add products to: <span id="addProductsKeyword"></span></h3>
-    <p class="add-products-subtitle">Search all still-live products from the historical index. Added products default to <strong>grade 1 (Relevant)</strong> in annotation mode and <strong>Approved</strong> in iteration mode.</p>
+    <p class="add-products-subtitle">Search all still-live products from the historical index. Added products are graded with the grade selected below in annotation mode, and <strong>Approved</strong> in iteration mode.</p>
+
+    <!-- Grade to apply to added products (annotation mode only) -->
+    <div class="add-products-grade" id="addGradeWrap" style="display:none">
+      <span class="add-products-grade-label">Add as:</span>
+      <label class="add-products-grade-opt">
+        <input type="radio" name="addGrade" value="1" checked onchange="onAddGradeChange()"> Grade 1 (Relevant)
+      </label>
+      <label class="add-products-grade-opt">
+        <input type="radio" name="addGrade" value="2" onchange="onAddGradeChange()"> Grade 2 (Perfect)
+      </label>
+    </div>
 
     <!-- Search + filter controls -->
     <div class="add-products-controls">
@@ -414,7 +425,7 @@
       <!-- Conflict table -->
       <div id="mergeConflictSection" style="display:none">
         <div class="merge-conflict-header">
-          <span class="merge-conflict-title">⚠ Label Conflicts — <span id="mergeConflictCount">0</span> items need review</span>
+          <span class="merge-conflict-title">⚠ Label Conflicts: <span id="mergeConflictCount">0</span> items need review</span>
           <span class="merge-conflict-hint">These keyword+product pairs were labeled differently. Current label is <code>null</code>. Resolve each below.</span>
         </div>
         <div class="merge-conflict-table-wrap">

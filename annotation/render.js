@@ -5,7 +5,7 @@
 // GRADE VISUAL CONSTANTS
 
 const GRADE_CLASS = { 0: 'grade-pill-0', 1: 'grade-pill-1', 2: 'grade-pill-2' };
-const GRADE_LABEL = { 0: '0 — Not relevant', 1: '1 — Relevant', 2: '2 — Perfect' };
+const GRADE_LABEL = { 0: '0 (Not relevant)', 1: '1 (Relevant)', 2: '2 (Perfect)' };
 
 // SIDEBAR
 
@@ -27,11 +27,11 @@ function annRenderSidebarBadge(kw, user) {
 function annRenderCardOverlay(pid) {
   return `<div class="card-actions-overlay">
     <button class="card-quick-btn grade-pill grade-pill-0"
-            onclick="quickGrade('${pid}', 0, event)" title="Grade 0 — Not relevant">0</button>
+            onclick="quickGrade('${pid}', 0, event)" title="Grade 0 (Not relevant)">0</button>
     <button class="card-quick-btn grade-pill grade-pill-1"
-            onclick="quickGrade('${pid}', 1, event)" title="Grade 1 — Relevant">1</button>
+            onclick="quickGrade('${pid}', 1, event)" title="Grade 1 (Relevant)">1</button>
     <button class="card-quick-btn grade-pill grade-pill-2"
-            onclick="quickGrade('${pid}', 2, event)" title="Grade 2 — Perfect">2</button>
+            onclick="quickGrade('${pid}', 2, event)" title="Grade 2 (Perfect)">2</button>
   </div>`;
 }
 
@@ -41,7 +41,7 @@ function annRenderGradeBadge(grade, pid) {
   const cls = GRADE_CLASS[grade] !== undefined ? GRADE_CLASS[grade] : '';
   return `<div class="card-status grade-badge ${cls}"
                onclick="event.stopPropagation(); openModal('${pid}')"
-               title="Grade ${grade} — click to relabel">${grade}</div>`;
+               title="Grade ${grade}, click to relabel">${grade}</div>`;
 }
 
 // METRICS BAR

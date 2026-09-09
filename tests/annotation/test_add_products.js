@@ -256,6 +256,22 @@ assert('export has a row for the added p9', !!addedLine);
 eq('added p9 exported with grade 1', addedLine.split(',')[gradeCol], '1');
 eq('added p9 qa_done TRUE', addedLine.split(',')[hdr.indexOf('sonus_qa_done')], 'TRUE');
 
+// Products can also be added at grade 2 (dialog grade selector) — the chosen
+// grade must reach the export, not the old hard-coded 1.
+annSetGrade('sonus', 'running shoes', 'p10', 2, { reason: 'manually_added' });
+goldenRows.push(buildAddedGoldenRow(goldenHeaders, 'gap', 'running shoes', 'p10'));
+
+const csv2 = annBuildExportCSV(goldenHeaders, goldenRows, 'sonus');
+const lines2 = csv2.split('\n');
+const added2 = lines2.find(l => l.split(',')[hdr.indexOf('product_id')] === 'p10');
+assert('export has a row for the added p10', !!added2);
+eq('added p10 exported with grade 2', added2.split(',')[gradeCol], '2');
+eq('added p10 qa_done TRUE', added2.split(',')[hdr.indexOf('sonus_qa_done')], 'TRUE');
+eq('grade-1 addition is unaffected by the grade-2 one',
+  lines2.find(l => l.split(',')[hdr.indexOf('product_id')] === 'p9').split(',')[gradeCol], '1');
+eq('grade 2 keeps the manual-add reason',
+  gradedLabels.sonus['running shoes::p10'].reason, 'manually_added');
+
 //  Summary
 console.log('\n' + '═'.repeat(60));
 console.log(`  Tests passed: ${passed}`);

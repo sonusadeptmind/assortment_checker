@@ -32,18 +32,20 @@ Every JSONL historical-index file (`catalog.jsonl`, `historical_index.jsonl`, `{
 
 `updated_at` is read from the top of each JSON record first, then from `product_dump.updated_at` as a fallback. Values can be ISO-8601 strings, `YYYY-MM-DD HH:MM:SS` strings (treated as UTC), epoch seconds, epoch milliseconds, or single-element lists wrapping any of those.
 
-To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pass `--max_age_days <N>` (use `0` to disable).
+To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pass `--max_age_days <N>` (use `0` to disable). In the dashboard the window is `HISTORICAL_INDEX_MAX_AGE_DAYS` in `annotation/data.js`.
 
----
+This is the **only** filter applied when an index is built — nothing is dropped for being out of stock. Out-of-stock products load normally and are shown with an **Out of Stock** ribbon so they can still be graded.
 
-## Product liveness filter (both modes)
+### When a card has no product details
 
-When you load a folder that contains a historical index, the dashboard asks **"Keep only live products?"** before it builds the index:
+A product id in the dataset can fail to resolve for two different reasons, and the grid names which one it is, because the fixes differ:
 
-- **Yes — live only** — only records whose `product_liveness` / `liveness` is `true` are kept; dead products and variants are dropped. The load notification reports how many were dropped.
-- **No — use full index** — the full historical index is used unchanged.
+| Card says | Meaning | Fix |
+|---|---|---|
+| **Filtered out by the 90-day rule** | The product *is* in the index file, but its `updated_at` is outside the window. The card shows the age (`last updated 182 days ago`). | Refresh the index, or raise `HISTORICAL_INDEX_MAX_AGE_DAYS`. |
+| **Not in the index file** | No record with that `product_id` exists in the file at all. | The index predates the product — regenerate it. |
 
-The prompt appears once per load, is decided fresh every time (it is **not** remembered), and applies to both the annotation and iteration/catalog load paths. It is independent of the 90-day recency filter above — both can apply to the same load.
+The load notification reports both counts separately, so you can tell a stale index from a genuinely missing product before opening a single keyword.
 
 ---
 
@@ -388,15 +390,17 @@ Three bulk buttons in place of two:
 
 - **Bulk-0** opens the existing bulk reason modal.
 - **Bulk-1 / Bulk-2** apply immediately.
-- Filters reset after every bulk action (same behavior as iteration mode).
+- Filters stay applied after a bulk action — they persist for the keyword until you press **✕ Clear** (same behavior as iteration mode). Only the product selection is dropped.
 
 ## Add Products
 
-The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword (defaulting to **grade 1 / Relevant** in annotation mode, **Approved** in iteration mode) — useful when a relevant product was missing from the original assortment.
+The **➕ Add Products** dialog lets you pull *still-live* products from the retailer's historical index into the active keyword — useful when a relevant product was missing from the original assortment.
 
 - **Search** matches a curated field set (title, brand, type, color, material, occasion, category). For a deep search across the full product JSON, switch the filter field to **Product Dump**.
 - **Multiple filters** — click **＋ Add filter** to commit the current field/operator/value as a pill and stack another (e.g. `Dump = "slim fit"` **and** `Dump = "long sleeve"`). All committed pills plus the in-progress control must match. Remove a pill with its **×** to re-run the search.
+- **Grade to apply** — in annotation mode an **Add as:** row lets you add the selection as **grade 1 (Relevant)** or **grade 2 (Perfect)**; it resets to grade 1 each time the dialog opens, and the confirm button shows the grade you're about to apply. Iteration mode has no grades, so the row is hidden and products are added as **Approved**.
 - Only live products are shown; anything already tied to the keyword is excluded.
+- Clicking a candidate card opens the read-only detail view, including its full product payload. Searching inside that payload keeps working for products that have not been added yet.
 - Added products are written back on CSV export (a golden row is appended so the addition survives a round-trip).
 
 See [Performance → Annotation-mode index loading & Add Products](#annotation-mode-index-loading--add-products) for the single-pass build, IndexedDB cache, and progress loaders behind this.
@@ -457,11 +461,6 @@ python scripts/evaluate_iteration.py \
 ```
 
 `--catalog` is required. The script reads `product_liveness` from the catalog to determine stock status for each product — `true` = in-stock, `false` = out of stock. Products not present in the catalog are assumed in-stock. Catalog ingestion uses the same 90-day `updated_at` filter as the dashboard.
-
-Outputs `iteration_N_report.xlsx` with two tabs:
-
-- **Summary** — per-keyword Precision, Recall, F1, label coverage, TP retention, FP elimination, regression flags, and `manual_qa_status`. Aggregate metrics (F1, Precision, Recall) are averaged only over keywords where `manual_qa_status = TRUE` — the aggregate row shows how many keywords contributed (e.g. `5 of 12 QA'd`).
-- **Dataset** — Updated `dataset.csv` ready for the next iteration, with `pids_to_check` highlighted
 
 ---
 

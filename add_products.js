@@ -1,7 +1,8 @@
 /* Add Products — search the live historical index and add products to the
-   active keyword, defaulting to "relevant" (grade 1 in annotation mode,
-   Approved/TP in iteration mode).  Loaded before app.js so its pure matcher
-   (productMatchesContentFilter) is available to app.js's _pidMatchesFilter.
+   active keyword as relevant (grade 1 or 2, reviewer's choice, in annotation
+   mode; Approved/TP in iteration mode).  Loaded before app.js so its pure
+   matcher (productMatchesContentFilter) is available to app.js's
+   _pidMatchesFilter.
 
    Data sources:
    - iteration mode: productIndex already holds the whole catalog → search it directly.
@@ -17,6 +18,7 @@ let addDialogSelected    = new Set();
 let addDialogCandidates  = [];   // current filtered candidate pids
 let addDialogPage        = 0;    // 0-indexed current page of the candidate list
 let addDialogFilters     = [];   // committed filter pills [{ field, operator, value, label }] — all AND-ed
+let addDialogGrade       = 1;    // annotation mode: grade applied to added products (1 or 2)
 let _addSearchDebounce   = null;
 
 const ADD_FIELD_LABELS = {
@@ -139,7 +141,9 @@ async function ensureFullLiveIndex() {
   let stream = indexFile.stream();
   if (isGzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
 
-  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, { liveOnly: true });
+  // Only the 90-day recency filter runs during the parse; the dialog's own
+  // liveness check (computeAddCandidates) keeps dead stock out of the results.
+  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, {});
   fullLiveIndex = newIndex;
   fullLiveDumps = newDumps;
   _fullLiveIndexRetailer = activeRetailer;
@@ -197,6 +201,7 @@ async function openAddProductsModal() {
   document.getElementById('addFilterOperator').value   = 'contains';
   addDialogSelected.clear();
   addDialogFilters = [];
+  resetAddGradeChoice();
   renderAddFilterPills();
   updateAddConfirmBtn();
   addProductsPopulateFilterValues();
@@ -444,15 +449,33 @@ function deselectAllAddCandidates() {
   updateAddConfirmBtn();
 }
 
+/** Reset the grade choice to 1 and show the selector in annotation mode only
+ *  (iteration mode has no grades — products are added as Approved). */
+function resetAddGradeChoice() {
+  addDialogGrade = 1;
+  const wrap = document.getElementById('addGradeWrap');
+  if (wrap) wrap.style.display = appMode === 'annotation' ? 'flex' : 'none';
+  const one = document.querySelector('input[name="addGrade"][value="1"]');
+  if (one) one.checked = true;
+}
+
+/** Radio handler for the grade selector — re-labels the confirm button. */
+function onAddGradeChange() {
+  const sel = document.querySelector('input[name="addGrade"]:checked');
+  addDialogGrade = sel ? parseInt(sel.value, 10) : 1;
+  updateAddConfirmBtn();
+}
+
 function updateAddConfirmBtn() {
   const btn = document.getElementById('addProductsConfirmBtn');
   const n   = addDialogSelected.size;
-  const verb = appMode === 'annotation' ? 'grade 1' : 'approved';
+  const verb = appMode === 'annotation' ? `grade ${addDialogGrade}` : 'approved';
   btn.disabled = n === 0;
   btn.textContent = n === 0 ? 'Add products' : `➕ Add ${n} product${n === 1 ? '' : 's'} (${verb})`;
 }
 
-/** Add the selected candidates to the active keyword, defaulting to relevant. */
+/** Add the selected candidates to the active keyword as relevant — at the
+ *  grade chosen in the dialog (annotation mode) or Approved (iteration mode). */
 function confirmAddProducts() {
   if (!activeKeyword) return;
   if (typeof requireUser === 'function' && !requireUser()) return;
@@ -478,7 +501,7 @@ function confirmAddProducts() {
     }
 
     if (appMode === 'annotation') {
-      annSetGrade(currentUser, kw, pid, 1, { reason: 'manually_added' });
+      annSetGrade(currentUser, kw, pid, addDialogGrade, { reason: 'manually_added' });
       // Append a golden row so the addition survives CSV export.
       const exists = goldenRows.some(r =>
         (r.keyword || '').trim() === kw && (r.product_id || '').trim() === pid);
@@ -513,7 +536,7 @@ function confirmAddProducts() {
   updateQaDoneUI();
   if (typeof scheduleAutoSave === 'function') scheduleAutoSave();
 
-  const verb = appMode === 'annotation' ? 'graded 1' : 'approved';
+  const verb = appMode === 'annotation' ? `graded ${addDialogGrade}` : 'approved';
   showToast(`Added ${pids.length} product${pids.length === 1 ? '' : 's'} to "${kw}" (${verb})`, 'success');
 }
 

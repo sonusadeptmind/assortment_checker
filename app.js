@@ -4,6 +4,10 @@
 let keywords = [];
 let productIndex = {};
 let productDumps = {};
+/* pid → updated_at of products that ARE in the index file but were dropped by
+   the 90-day recency filter.  Kept so a card can say "filtered out, last
+   updated N days ago" instead of the misleading "not in catalog". */
+let staleFilteredPids = {};
 let activeKeyword = null;      // current keyword object
 let disapprovals = {};          // { "keyword::pid": {reason, attribute, ...} }
 let approvals = {};             // { "keyword::pid": {keyword, product_id, created_at, meta_data} }
@@ -174,6 +178,24 @@ function getBasePids() {
   if (!activeKeyword) return [];
   return (activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
     ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+}
+
+/** PID for a raw JSONL doc: top level first, product_dump as fallback.
+ *  toStr handles numeric ids and stringifies safely. */
+function docPid(doc) {
+  if (!doc || typeof doc !== 'object') return '';
+  const dump = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
+    ? doc.product_dump : null;
+  return toStr(doc.product_id || doc.id || doc._id
+    || (dump && (dump.product_id || dump.id)));
+}
+
+/** How stale a dropped product is, as a human phrase for the card/tooltip. */
+function staleAgeLabel(updatedAt) {
+  const dt = (typeof parseUpdatedAt === 'function') ? parseUpdatedAt(updatedAt) : null;
+  if (!dt) return 'no usable updated_at';
+  const days = Math.floor((Date.now() - dt.getTime()) / 86400000);
+  return `last updated ${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 /** Strict whole-word match (word-boundary regex).
@@ -705,10 +727,13 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
     // 6. Cross-ref warnings
     const allNeeded  = new Set(keywords.flatMap(kw => kw.product_ids));
     const catalogIds = new Set(Object.keys(productIndex));
-    const missing    = [...allNeeded].filter(p => !catalogIds.has(p));
+    // Absent from the file is a different problem from dropped by the recency
+    // filter, and needs a different fix, so never lump them together.
+    const missing = [...allNeeded].filter(p => !catalogIds.has(p) && !staleFilteredPids[p]);
     if (missing.length) {
       notifications.push({ type: 'warn',
-        text: `${missing.length} product ID${missing.length > 1 ? 's' : ''} not found in catalog — cards will show "Product not in catalog".` });
+        text: `${missing.length} product ID${missing.length > 1 ? 's' : ''} are not present in the index file at all `
+            + `— cards will show "Not in the index file". The index may predate these products.` });
     }
 
     console.log('[Annotation] Load complete ✅', { keywords: keywords.length, products: Object.keys(productIndex).length });
@@ -775,7 +800,7 @@ function _idbOpen() {
  *  date-relative, so a key valid today must miss tomorrow), and a hash of the
  *  golden-PID set (editing the CSV must invalidate the golden subset).  Pure —
  *  dayStamp is passed in so callers control time. */
-function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids, dayStamp, liveOnly) {
+function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids, dayStamp, oosMode) {
   const pids = (allowedPids || []).slice().sort();
   let h = 5381;
   for (let i = 0; i < pids.length; i++) {
@@ -783,10 +808,11 @@ function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids,
     for (let j = 0; j < s.length; j++) h = ((h << 5) + h + s.charCodeAt(j)) | 0;
   }
   const pidSig = pids.length + '_' + (h >>> 0).toString(36);
-  // live-only flag is part of the key — a "live only" load must never reuse a
-  // cached full-index entry (or vice-versa).
-  const liveSig = liveOnly ? 'live' : 'all';
-  return [retailer, fileName, size, lastModified, dayStamp, pidSig, liveSig].join('::');
+  // The OOS policy is part of the key — an "exclude OOS" load must never reuse
+  // an "include OOS" cache entry (or vice-versa).  dayStamp already rolls the
+  // key daily, which also keeps the 30-day OOS window from going stale.
+  const oosSig = oosMode === 'exclude' ? 'oos-exclude' : 'oos-include';
+  return [retailer, fileName, size, lastModified, dayStamp, pidSig, oosSig].join('::');
 }
 
 async function idbGetIndex(key) {
@@ -857,12 +883,13 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
 
   // 2b. IndexedDB cache — a repeat load of this file/retailer/day skips the parse.
   const dayStamp = Math.floor(Date.now() / 86400000);
-  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp, keepLiveOnly);
+  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp);
   if (loadingMsg) loadingMsg.textContent = `Loading cached ${retailer} index…`;
   const cached = await idbGetIndex(cacheKey);
   if (cached && cached.productIndex && cached.fullIndex) {
     productIndex = cached.productIndex;
     productDumps = cached.productDumps || {};
+    staleFilteredPids = cached.stalePids || {};
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, cached.fullDumps || {}, retailer);
     const n = Object.keys(productIndex).length;
     console.log(`[Annotation] Cache hit "${cacheKey}" — ${n} products, parse skipped`);
@@ -888,17 +915,18 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
       : null;
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale, liveDropped, fullIndex, fullDumps } =
-      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, liveOnly: keepLiveOnly, onProgress });
+    const { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps } =
+      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
+    staleFilteredPids = stalePids;
 
     // Seed the Add Products cache from this same pass — no second file read.
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
 
     // Persist for instant repeat loads (best-effort, non-blocking).
-    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps });
+    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps, stalePids });
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -912,15 +940,20 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
               + `(${skippedStale} stale, dropped by 90-day filter). `
               + `Check product_id values and updated_at recency in the CSV.` });
     } else {
+      const wantedStale = Object.keys(stalePids).length;
       const staleNote = skippedStale > 0
-        ? ` (${skippedStale} stale records dropped by 90-day filter)`
-        : '';
-      const liveNote = (keepLiveOnly && liveDropped > 0)
-        ? ` Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped.`
+        ? ` (${skippedStale} stale records dropped by the 90-day filter)`
         : '';
       notifications.push({ type: 'info',
         text: `"${indexFile.name}": loaded ${loaded} of ${allowedPids.length} products `
-            + `(${fileSizeKB} KB streamed)${staleNote}.${liveNote}` });
+            + `(${fileSizeKB} KB streamed)${staleNote}.` });
+      if (wantedStale > 0) {
+        notifications.push({ type: 'warn',
+          text: `${wantedStale} of the ${allowedPids.length} products this dataset asks for are in `
+              + `"${indexFile.name}" but were dropped by the 90-day updated_at filter, so they cannot `
+              + `be reviewed. Their cards say "Filtered out by the 90-day rule" with the age. `
+              + `Refresh the index, or raise HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
+      }
     }
   } catch (e) {
     notifications.push({ type: 'error', text: `Failed to parse "${indexFile.name}": ${e.message}` });
@@ -939,12 +972,13 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
  */
 async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
-  const liveOnly = !!opts.liveOnly;
+
   const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
   const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
-  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0, liveDropped = 0;
+  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
+  const stalePids = {};                         // requested PIDs the 90-day filter dropped
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
@@ -960,14 +994,21 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     // 90-day recency filter — skip records updated more than 90 days ago,
     // or with no parseable updated_at field.  Applied before the allowed-PID
     // check so stale records are counted independently of dataset membership.
-    if (!isRecentUpdate(pickUpdatedAt(doc))) { skippedStale++; return; }
+    const updatedAt = pickUpdatedAt(doc);
+    if (!isRecentUpdate(updatedAt)) {
+      skippedStale++;
+      // Remember the ones the dataset actually asked for: the product IS in the
+      // index file, so the grid must not claim it is missing from the catalog.
+      if (allowed) {
+        const sp = docPid(doc);
+        if (sp && allowed.has(sp)) stalePids[sp] = updatedAt;
+      }
+      return;
+    }
 
-    // PID: at top level, with product_dump as fallback. toStr handles
-    // numeric ids and stringifies safely.
-    const dump   = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
+    const dump = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
       ? doc.product_dump : null;
-    const pid = toStr(doc.product_id || doc.id || doc._id
-      || (dump && (dump.product_id || dump.id)));
+    const pid = docPid(doc);
     if (!pid) { skipped++; return; }
 
     const inGolden = !allowed || allowed.has(pid);
@@ -978,10 +1019,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     const docDump = dump || doc;   // store product_dump for the modal JSON viewer
     const isLive  = record.liveness !== false;
 
-    if (inGolden) {
-      if (liveOnly && !isLive) { skipped++; liveDropped++; }   // live-only: drop dead products
-      else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
-    }
+    if (inGolden) { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
     // The full live pool feeds Add Products without a second file read.
     if (buildFullLive && isLive) {
       fullIndex[pid] = record; fullDumps[pid] = docDump;
@@ -1015,7 +1053,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
 
   if (onProgress) onProgress(fullCount);   // land on the true total
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale, liveDropped, fullIndex, fullDumps };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -1066,58 +1104,6 @@ async function switchAnnotationRetailer(retailer) {
   }
 }
 
-// LIVE-ONLY INDEX TOGGLE
-// When loading the historical index, the user is asked whether to keep only
-// live products. "Yes" → the built index contains only records whose liveness
-// is true (dead products/variants dropped). "No" → the full historical index
-// is used unchanged. Re-asked on every load (not persisted). Read by both the
-// annotation index path and the catalog/review path; only affects which
-// products land in the index (size + membership), never downstream behavior.
-let keepLiveOnly = false;
-
-/** Ask the user whether to keep only live products. Returns Promise<boolean>.
- *  Builds a small modal reusing existing modal CSS; resolves on choice and
- *  removes itself. Falls back to `false` (keep all) if the DOM is unavailable. */
-function confirmKeepLiveOnly() {
-  return new Promise(resolve => {
-    if (typeof document === 'undefined' || !document.body) { resolve(false); return; }
-
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.style.display = 'flex';
-    backdrop.style.zIndex = '10000';   // above the loading overlay
-    backdrop.innerHTML = `
-      <div class="modal modal-sm" onclick="event.stopPropagation()">
-        <h3>Keep only live products?</h3>
-        <p>This historical index can include products that are no longer live.
-           Choose <strong>Yes</strong> to build the index from live products and
-           variants only (<code>liveness = true</code>), or <strong>No</strong>
-           to use the full historical index.</p>
-        <div class="modal-actions" style="justify-content:flex-end;gap:8px;margin-top:16px">
-          <button class="btn" data-choice="no">No — use full index</button>
-          <button class="btn btn-primary" data-choice="yes">Yes — live only</button>
-        </div>
-      </div>`;
-
-    let done = false;
-    const finish = val => {
-      if (done) return;
-      done = true;
-      backdrop.remove();
-      document.removeEventListener('keydown', onKey);
-      resolve(val);
-    };
-    const onKey = e => { if (e.key === 'Escape') finish(false); };
-
-    backdrop.addEventListener('click', () => finish(false));   // click-away = No
-    backdrop.querySelector('[data-choice="yes"]').addEventListener('click', () => finish(true));
-    backdrop.querySelector('[data-choice="no"]').addEventListener('click', () => finish(false));
-    document.addEventListener('keydown', onKey);
-
-    document.body.appendChild(backdrop);
-  });
-}
-
 async function handleFolderLoad(dirHandle) {
   // Collect file handles first — .name is available without taking a File
   // snapshot, so we can decide whether to prompt without calling getFile() yet.
@@ -1126,21 +1112,6 @@ async function handleFolderLoad(dirHandle) {
     if (entry.kind === 'file') fileHandles.push(entry);
   }
 
-  // Ask once per load whether to keep only live products, before the loading
-  // overlay goes up. Only prompt when there's actually an index to build from
-  // (a .jsonl/.jsonl.gz catalog or a pre-built product_index.json). Applies to
-  // both the annotation and catalog/review load paths below.
-  //
-  // This prompt MUST run before getFile() below: confirmKeepLiveOnly() blocks
-  // on human input, and a File snapshot taken before that wait can go stale by
-  // the time it's read, making the read throw NotReadableError ("…permission
-  // problems that have occurred after a reference to a file was acquired").
-  const hasIndexFile = fileHandles.some(h =>
-    h.name.endsWith('.jsonl') || h.name.endsWith('.jsonl.gz') || h.name === 'product_index.json');
-  keepLiveOnly = hasIndexFile ? await confirmKeepLiveOnly() : false;
-
-  // Now take the File snapshots — immediately before they're read — so the
-  // snapshot-to-read window stays small regardless of how long the prompt sat open.
   const files = [];
   for (const h of fileHandles) files.push(await h.getFile());
 
@@ -1212,21 +1183,13 @@ async function handleFolderLoad(dirHandle) {
       // missing image_url, liveness as 0/1) — we collapse to one schema.
       const cleanIndex = {};
       let normSkipped = 0;
-      let liveDropped = 0;
       for (const [rawPid, rawProduct] of Object.entries(rawIndex)) {
         const pid = toStr(rawPid);
         if (!pid) { normSkipped++; continue; }
-        const rec = normalizeProductRecord(rawProduct, pid);
-        if (keepLiveOnly && rec.liveness === false) { liveDropped++; continue; }   // live-only: drop dead products
-        cleanIndex[pid] = rec;
+        cleanIndex[pid] = normalizeProductRecord(rawProduct, pid);
       }
       productIndex = cleanIndex;
       if (normSkipped) console.warn(`[Step 1] Skipped ${normSkipped} entries with empty product_id keys.`);
-      if (keepLiveOnly && liveDropped) {
-        console.log(`[Step 1] Live-only mode: dropped ${liveDropped} non-live products.`);
-        notifications.push({ type: 'info',
-          text: `Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped from the index.` });
-      }
       console.log(`[Step 1] product_index.json loaded — ${Object.keys(productIndex).length} products`);
 
       loadingMsg.textContent = 'Loading product dumps…';
@@ -1237,8 +1200,7 @@ async function handleFolderLoad(dirHandle) {
         const cleanDumps = {};
         for (const [rawPid, dump] of Object.entries(rawDumps)) {
           const pid = toStr(rawPid);
-          // In live-only mode keep dumps in sync with the filtered index.
-          if (pid && (!keepLiveOnly || productIndex[pid])) cleanDumps[pid] = dump;
+          if (pid) cleanDumps[pid] = dump;
         }
         productDumps = cleanDumps;
       } else {
@@ -1295,7 +1257,7 @@ async function handleFolderLoad(dirHandle) {
       let parsed = 0;
       let skipped = 0;
       let skippedStale = 0;
-      let liveDropped = 0;
+      staleFilteredPids = {};
       let seenValid = 0;     // valid, recent product records seen (before the PID filter)
       let lineNo = 0;
       const parseErrors = [];
@@ -1320,8 +1282,15 @@ async function handleFolderLoad(dirHandle) {
         }
 
         // 90-day recency filter — skip records updated more than 90 days ago,
-        // or with no parseable updated_at field.
-        if (!isRecentUpdate(pickUpdatedAt(doc))) { skippedStale++; return; }
+        // or with no parseable updated_at field.  Requested PIDs are remembered
+        // so their cards can say they were filtered out, not that they are missing.
+        const updatedAt = pickUpdatedAt(doc);
+        if (!isRecentUpdate(updatedAt)) {
+          skippedStale++;
+          const sp = docPid(doc);
+          if (sp && (neededPids.size === 0 || neededPids.has(sp))) staleFilteredPids[sp] = updatedAt;
+          return;
+        }
 
         // PID can come in as a number, string, or nested in product_dump.
         // toStr handles every case; we drop only when it's truly empty.
@@ -1345,7 +1314,6 @@ async function handleFolderLoad(dirHandle) {
         // collapses to the same predictable schema.
         // product_liveness defaults to true for products not in catalog (mirrors evaluate_iteration.py).
         const rec = normalizeProductRecord(doc, pid);
-        if (keepLiveOnly && rec.liveness === false) { liveDropped++; return; }   // live-only: drop dead products
         newIndex[pid] = rec;
         newDumps[pid] = dumpForPid || doc;
         parsed++;
@@ -1392,7 +1360,7 @@ async function handleFolderLoad(dirHandle) {
         );
       }
       if (!parsed) {
-        console.warn(`[Step 1] "${jsonlFile.name}": ${seenValid.toLocaleString()} recent products scanned, but none matched the ${neededPids.size} dataset PIDs — all cards will show "Product not in catalog".`);
+        console.warn(`[Step 1] "${jsonlFile.name}": ${seenValid.toLocaleString()} recent products scanned, but none matched the ${neededPids.size} dataset PIDs, so no card will have product details.`);
       }
 
       if (skipped > 0) {
@@ -1403,17 +1371,11 @@ async function handleFolderLoad(dirHandle) {
       }
       console.log(`[Step 1] Parsed "${jsonlFile.name}": ${parsed} products, ${skipped} lines skipped, ${skippedStale} filtered by 90-day recency`);
 
-      if (keepLiveOnly && liveDropped > 0) {
-        console.log(`[Step 1] Live-only mode: dropped ${liveDropped} non-live products from "${jsonlFile.name}".`);
-      }
       productIndex = newIndex;
       productDumps = newDumps;
       const staleNote = skippedStale > 0 ? ` (${skippedStale} stale records dropped by 90-day filter)` : '';
-      const liveNote = (keepLiveOnly && liveDropped > 0)
-        ? ` Live-only mode: ${liveDropped} non-live product${liveDropped > 1 ? 's' : ''} dropped.`
-        : '';
       notifications.push({ type: 'info',
-        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.${liveNote}` });
+        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.` });
     }
     };   // end loadCatalog — invoked after dataset.csv + new_iteration.xlsx below
 
@@ -1571,11 +1533,21 @@ async function handleFolderLoad(dirHandle) {
       (kw.new_iteration_ids || []).forEach(p => allNeeded.add(p));
     });
     const catalogIds = new Set(Object.keys(productIndex));
-    const missingPids = [...allNeeded].filter(p => !catalogIds.has(p));
-    if (missingPids.length) {
-      console.warn(`[Step 4] ${missingPids.length} product IDs in dataset not found in catalog. First 10:`, missingPids.slice(0, 10));
+    const unresolved  = [...allNeeded].filter(p => !catalogIds.has(p));
+    const filteredOut = unresolved.filter(p => staleFilteredPids[p]);
+    const missingPids = unresolved.filter(p => !staleFilteredPids[p]);
+    if (filteredOut.length) {
+      console.warn(`[Step 4] ${filteredOut.length} dataset PIDs are in the catalog but were dropped by the 90-day filter. First 10:`, filteredOut.slice(0, 10));
       notifications.push({ type: 'warn',
-        text: `${missingPids.length} product ID${missingPids.length > 1 ? 's' : ''} in the dataset were not found in the catalog — those cards will show as "Product not in catalog". See console for the full list.` });
+        text: `${filteredOut.length} product ID${filteredOut.length > 1 ? 's' : ''} in the dataset are present in the catalog `
+            + `but were dropped by the 90-day updated_at filter, so they cannot be reviewed. Their cards say `
+            + `"Filtered out by the 90-day rule" with the age. Refresh the catalog, or raise `
+            + `HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
+    }
+    if (missingPids.length) {
+      console.warn(`[Step 4] ${missingPids.length} product IDs in dataset not present in the catalog file at all. First 10:`, missingPids.slice(0, 10));
+      notifications.push({ type: 'warn',
+        text: `${missingPids.length} product ID${missingPids.length > 1 ? 's' : ''} in the dataset are not present in the catalog file at all — those cards will show "Not in the index file". See console for the full list.` });
     }
 
     console.log('[QA Dashboard] Load complete ✅', {
@@ -1730,10 +1702,25 @@ function renderGrid() {
 
   grid.innerHTML = pids.map(pid => {
     const p = productIndex[pid];
-    if (!p) return `<div class="product-card" onclick="openModal('${pid}')">
-      <div class="card-image-wrap" style="display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:12px;">Product not in catalog</div>
-      <div class="card-body"><div class="card-title">${pid}</div></div>
-    </div>`;
+    if (!p) {
+      // Two very different reasons a product has no catalog entry, with two
+      // different fixes — say which one it is.
+      const staleAt = staleFilteredPids[pid];
+      const headline = staleAt ? 'Filtered out by the 90-day rule' : 'Not in the index file';
+      const detail   = staleAt
+        ? staleAgeLabel(staleAt)
+        : 'the index has no record for this id';
+      const title    = staleAt
+        ? `This product IS in the index file but its updated_at is outside the ${HISTORICAL_INDEX_MAX_AGE_DAYS}-day window (${staleAgeLabel(staleAt)}), so it was not loaded. Refresh the index to review it.`
+        : 'No record with this product_id was found in the index file.';
+      return `<div class="product-card card-unresolved ${staleAt ? 'card-stale' : 'card-absent'}" title="${escapeHtml(title)}">
+        <div class="card-image-wrap card-unresolved-wrap">
+          <div class="card-unresolved-headline">${headline}</div>
+          <div class="card-unresolved-detail">${escapeHtml(detail)}</div>
+        </div>
+        <div class="card-body"><div class="card-title">${escapeHtml(pid)}</div></div>
+      </div>`;
+    }
 
     const key = `${activeKeyword.keyword}::${pid}`;
     const isInStock  = isInStockPid(pid);
@@ -1888,9 +1875,9 @@ function populateFilterValues() {
     textEl.style.display = 'none'; selectEl.style.display = '';
     selectEl.innerHTML = `
       <option value="">Select grade…</option>
-      <option value="0">0 — Not relevant</option>
-      <option value="1">1 — Relevant</option>
-      <option value="2">2 — Perfect</option>
+      <option value="0">0 (Not relevant)</option>
+      <option value="1">1 (Relevant)</option>
+      <option value="2">2 (Perfect)</option>
       <option value="unlabeled">Unlabeled</option>`;
   } else {
     textEl.style.display = 'none'; selectEl.style.display = '';
@@ -1966,6 +1953,19 @@ function clearFilter() {
   const priorBtn = document.getElementById('showPriorBtn');
   if (priorBtn) priorBtn.classList.remove('toggle-pill-active');
   initFilterDefaults();
+  renderFilterPills();
+  updateFiltersBadge();
+  updateGridCount();
+  renderGrid();
+}
+
+/** Post-marking refresh.  A filter stays applied to the keyword until the
+ *  reviewer clears it explicitly, so marking products must NOT call
+ *  clearFilter() — it only drops the now-stale selection and re-renders the
+ *  grid against the new labels. */
+function refreshAfterMarking() {
+  selectedPids.clear();
+  recomputeFilteredPids();
   renderFilterPills();
   updateFiltersBadge();
   updateGridCount();
@@ -2103,6 +2103,16 @@ function requireUser() {
 
 // DETAIL MODAL
 
+/** Resolve a product's raw dump for the detail modal.  Falls back to the Add
+ *  Products live sources: a candidate browsed from the Add dialog is not in
+ *  productDumps until it is actually added, and without this fallback the
+ *  payload view blanks out the moment it is re-read (e.g. on dump search). */
+function resolveProductDump(pid) {
+  return productDumps[pid]
+    || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null)
+    || {};
+}
+
 function openModal(pid, opts = {}) {
   modalPid = pid;
   const viewOnly = opts && opts.viewOnly === true;
@@ -2110,8 +2120,7 @@ function openModal(pid, opts = {}) {
   // browsed in the Add dialog isn't in productIndex/productDumps until it's added.
   const p = productIndex[pid]
     || (typeof getAddSourceIndex === 'function' ? getAddSourceIndex()[pid] : null) || {};
-  const dump = productDumps[pid]
-    || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null) || {};
+  const dump = resolveProductDump(pid);
   const key = `${activeKeyword.keyword}::${pid}`;
   const isDisapproved = !!disapprovals[key];
 
@@ -2196,8 +2205,7 @@ function searchProductDump() {
   const countEl = document.getElementById('dumpSearchCount');
   const prevBtn = document.getElementById('dumpNavPrev');
   const nextBtn = document.getElementById('dumpNavNext');
-  const dump = productDumps[modalPid] || {};
-  const dumpStr = JSON.stringify(dump, null, 2);
+  const dumpStr = JSON.stringify(resolveProductDump(modalPid), null, 2);
 
   if (!query) {
     pre.innerHTML = '';
@@ -2404,7 +2412,7 @@ function confirmBulkDisapproval() {
   });
 
   closeBulkModal();
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   updateQaDoneUI();
   renderKeywordList();
@@ -2426,7 +2434,7 @@ function bulkApprove() {
     };
     recordLabelChange(activeKeyword.keyword, pid, 'TP');
   });
-  clearFilter();
+  refreshAfterMarking();
   updateMetrics();
   updateQaDoneUI();
   renderKeywordList();
