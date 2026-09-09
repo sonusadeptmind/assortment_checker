@@ -141,8 +141,9 @@ async function ensureFullLiveIndex() {
   let stream = indexFile.stream();
   if (isGzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
 
-  // The Add Products pool is live-only by definition — it never offers dead stock.
-  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, { liveOnly: true });
+  // Only the 90-day recency filter runs during the parse; the dialog's own
+  // liveness check (computeAddCandidates) keeps dead stock out of the results.
+  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, {});
   fullLiveIndex = newIndex;
   fullLiveDumps = newDumps;
   _fullLiveIndexRetailer = activeRetailer;

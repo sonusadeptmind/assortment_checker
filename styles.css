@@ -1932,6 +1932,17 @@ mark.dump-highlight-active {
 .add-products-title span { color: var(--accent-hover); }
 .add-products-subtitle { margin: 0 0 14px; color: var(--text-secondary); font-size: 13px; }
 
+/* Cards for PIDs with no catalog entry — filtered out vs. genuinely absent. */
+.card-unresolved { cursor: default; }
+.card-unresolved-wrap {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; text-align: center; padding: 10px;
+}
+.card-unresolved-headline { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.card-unresolved-detail   { font-size: 11px; color: var(--text-muted); }
+.card-stale  .card-unresolved-headline { color: #d18f2e; }
+.card-absent .card-unresolved-headline { color: var(--text-muted); }
+
 .add-products-grade {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   margin: 0 0 14px; font-size: 13px; color: var(--text-secondary);

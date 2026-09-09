@@ -32,7 +32,20 @@ Every JSONL historical-index file (`catalog.jsonl`, `historical_index.jsonl`, `{
 
 `updated_at` is read from the top of each JSON record first, then from `product_dump.updated_at` as a fallback. Values can be ISO-8601 strings, `YYYY-MM-DD HH:MM:SS` strings (treated as UTC), epoch seconds, epoch milliseconds, or single-element lists wrapping any of those.
 
-To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pass `--max_age_days <N>` (use `0` to disable).
+To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pass `--max_age_days <N>` (use `0` to disable). In the dashboard the window is `HISTORICAL_INDEX_MAX_AGE_DAYS` in `annotation/data.js`.
+
+This is the **only** filter applied when an index is built — nothing is dropped for being out of stock. Out-of-stock products load normally and are shown with an **Out of Stock** ribbon so they can still be graded.
+
+### When a card has no product details
+
+A product id in the dataset can fail to resolve for two different reasons, and the grid names which one it is, because the fixes differ:
+
+| Card says | Meaning | Fix |
+|---|---|---|
+| **Filtered out by the 90-day rule** | The product *is* in the index file, but its `updated_at` is outside the window. The card shows the age (`last updated 182 days ago`). | Refresh the index, or raise `HISTORICAL_INDEX_MAX_AGE_DAYS`. |
+| **Not in the index file** | No record with that `product_id` exists in the file at all. | The index predates the product — regenerate it. |
+
+The load notification reports both counts separately, so you can tell a stale index from a genuinely missing product before opening a single keyword.
 
 ---
 

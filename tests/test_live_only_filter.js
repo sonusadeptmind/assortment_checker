@@ -3,8 +3,11 @@
  *
  * Run with:  node tests/test_live_only_filter.js
  *
- * Replicates the liveness derivation and the "drop dead records" filter that
- * the Add Products pool builds on (_parseAnnotationJsonlStream liveOnly).
+ * The index parse itself applies only the 90-day recency filter — nothing is
+ * dropped for being out of stock.  What this file pins down is the liveness
+ * DERIVATION (normalizeProductRecord) and the "drop dead records" pass that
+ * the Add Products dialog still runs at query time (computeAddCandidates),
+ * where a live-only pool is the whole point.
  *
  * Invariants verified:
  *   - liveOnly=false  → historical index unchanged; every record kept, dead

@@ -4,6 +4,10 @@
 let keywords = [];
 let productIndex = {};
 let productDumps = {};
+/* pid → updated_at of products that ARE in the index file but were dropped by
+   the 90-day recency filter.  Kept so a card can say "filtered out, last
+   updated N days ago" instead of the misleading "not in catalog". */
+let staleFilteredPids = {};
 let activeKeyword = null;      // current keyword object
 let disapprovals = {};          // { "keyword::pid": {reason, attribute, ...} }
 let approvals = {};             // { "keyword::pid": {keyword, product_id, created_at, meta_data} }
@@ -174,6 +178,24 @@ function getBasePids() {
   if (!activeKeyword) return [];
   return (activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
     ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+}
+
+/** PID for a raw JSONL doc: top level first, product_dump as fallback.
+ *  toStr handles numeric ids and stringifies safely. */
+function docPid(doc) {
+  if (!doc || typeof doc !== 'object') return '';
+  const dump = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
+    ? doc.product_dump : null;
+  return toStr(doc.product_id || doc.id || doc._id
+    || (dump && (dump.product_id || dump.id)));
+}
+
+/** How stale a dropped product is, as a human phrase for the card/tooltip. */
+function staleAgeLabel(updatedAt) {
+  const dt = (typeof parseUpdatedAt === 'function') ? parseUpdatedAt(updatedAt) : null;
+  if (!dt) return 'no usable updated_at';
+  const days = Math.floor((Date.now() - dt.getTime()) / 86400000);
+  return `last updated ${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 /** Strict whole-word match (word-boundary regex).
@@ -705,10 +727,13 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
     // 6. Cross-ref warnings
     const allNeeded  = new Set(keywords.flatMap(kw => kw.product_ids));
     const catalogIds = new Set(Object.keys(productIndex));
-    const missing    = [...allNeeded].filter(p => !catalogIds.has(p));
+    // Absent from the file is a different problem from dropped by the recency
+    // filter, and needs a different fix, so never lump them together.
+    const missing = [...allNeeded].filter(p => !catalogIds.has(p) && !staleFilteredPids[p]);
     if (missing.length) {
       notifications.push({ type: 'warn',
-        text: `${missing.length} product ID${missing.length > 1 ? 's' : ''} not found in catalog — cards will show "Product not in catalog".` });
+        text: `${missing.length} product ID${missing.length > 1 ? 's' : ''} are not present in the index file at all `
+            + `— cards will show "Not in the index file". The index may predate these products.` });
     }
 
     console.log('[Annotation] Load complete ✅', { keywords: keywords.length, products: Object.keys(productIndex).length });
@@ -864,6 +889,7 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
   if (cached && cached.productIndex && cached.fullIndex) {
     productIndex = cached.productIndex;
     productDumps = cached.productDumps || {};
+    staleFilteredPids = cached.stalePids || {};
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, cached.fullDumps || {}, retailer);
     const n = Object.keys(productIndex).length;
     console.log(`[Annotation] Cache hit "${cacheKey}" — ${n} products, parse skipped`);
@@ -889,17 +915,18 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
       : null;
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps } =
+    const { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps } =
       await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
+    staleFilteredPids = stalePids;
 
     // Seed the Add Products cache from this same pass — no second file read.
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
 
     // Persist for instant repeat loads (best-effort, non-blocking).
-    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps });
+    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps, stalePids });
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -913,12 +940,20 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
               + `(${skippedStale} stale, dropped by 90-day filter). `
               + `Check product_id values and updated_at recency in the CSV.` });
     } else {
+      const wantedStale = Object.keys(stalePids).length;
       const staleNote = skippedStale > 0
-        ? ` (${skippedStale} stale records dropped by 90-day filter)`
+        ? ` (${skippedStale} stale records dropped by the 90-day filter)`
         : '';
       notifications.push({ type: 'info',
         text: `"${indexFile.name}": loaded ${loaded} of ${allowedPids.length} products `
             + `(${fileSizeKB} KB streamed)${staleNote}.` });
+      if (wantedStale > 0) {
+        notifications.push({ type: 'warn',
+          text: `${wantedStale} of the ${allowedPids.length} products this dataset asks for are in `
+              + `"${indexFile.name}" but were dropped by the 90-day updated_at filter, so they cannot `
+              + `be reviewed. Their cards say "Filtered out by the 90-day rule" with the age. `
+              + `Refresh the index, or raise HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
+      }
     }
   } catch (e) {
     notifications.push({ type: 'error', text: `Failed to parse "${indexFile.name}": ${e.message}` });
@@ -937,13 +972,13 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
  */
 async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
-  const liveOnly = !!opts.liveOnly;             // Add Products pool only
 
   const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
   const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
   let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
+  const stalePids = {};                         // requested PIDs the 90-day filter dropped
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
@@ -960,14 +995,20 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     // or with no parseable updated_at field.  Applied before the allowed-PID
     // check so stale records are counted independently of dataset membership.
     const updatedAt = pickUpdatedAt(doc);
-    if (!isRecentUpdate(updatedAt)) { skippedStale++; return; }
+    if (!isRecentUpdate(updatedAt)) {
+      skippedStale++;
+      // Remember the ones the dataset actually asked for: the product IS in the
+      // index file, so the grid must not claim it is missing from the catalog.
+      if (allowed) {
+        const sp = docPid(doc);
+        if (sp && allowed.has(sp)) stalePids[sp] = updatedAt;
+      }
+      return;
+    }
 
-    // PID: at top level, with product_dump as fallback. toStr handles
-    // numeric ids and stringifies safely.
-    const dump   = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
+    const dump = (doc.product_dump && typeof doc.product_dump === 'object' && !Array.isArray(doc.product_dump))
       ? doc.product_dump : null;
-    const pid = toStr(doc.product_id || doc.id || doc._id
-      || (dump && (dump.product_id || dump.id)));
+    const pid = docPid(doc);
     if (!pid) { skipped++; return; }
 
     const inGolden = !allowed || allowed.has(pid);
@@ -978,10 +1019,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     const docDump = dump || doc;   // store product_dump for the modal JSON viewer
     const isLive  = record.liveness !== false;
 
-    if (inGolden) {
-      if (liveOnly && !isLive) skipped++;       // Add Products never offers dead stock
-      else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
-    }
+    if (inGolden) { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
     // The full live pool feeds Add Products without a second file read.
     if (buildFullLive && isLive) {
       fullIndex[pid] = record; fullDumps[pid] = docDump;
@@ -1015,7 +1053,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
 
   if (onProgress) onProgress(fullCount);   // land on the true total
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -1219,6 +1257,7 @@ async function handleFolderLoad(dirHandle) {
       let parsed = 0;
       let skipped = 0;
       let skippedStale = 0;
+      staleFilteredPids = {};
       let seenValid = 0;     // valid, recent product records seen (before the PID filter)
       let lineNo = 0;
       const parseErrors = [];
@@ -1243,8 +1282,15 @@ async function handleFolderLoad(dirHandle) {
         }
 
         // 90-day recency filter — skip records updated more than 90 days ago,
-        // or with no parseable updated_at field.
-        if (!isRecentUpdate(pickUpdatedAt(doc))) { skippedStale++; return; }
+        // or with no parseable updated_at field.  Requested PIDs are remembered
+        // so their cards can say they were filtered out, not that they are missing.
+        const updatedAt = pickUpdatedAt(doc);
+        if (!isRecentUpdate(updatedAt)) {
+          skippedStale++;
+          const sp = docPid(doc);
+          if (sp && (neededPids.size === 0 || neededPids.has(sp))) staleFilteredPids[sp] = updatedAt;
+          return;
+        }
 
         // PID can come in as a number, string, or nested in product_dump.
         // toStr handles every case; we drop only when it's truly empty.
@@ -1487,11 +1533,21 @@ async function handleFolderLoad(dirHandle) {
       (kw.new_iteration_ids || []).forEach(p => allNeeded.add(p));
     });
     const catalogIds = new Set(Object.keys(productIndex));
-    const missingPids = [...allNeeded].filter(p => !catalogIds.has(p));
-    if (missingPids.length) {
-      console.warn(`[Step 4] ${missingPids.length} product IDs in dataset not found in catalog. First 10:`, missingPids.slice(0, 10));
+    const unresolved  = [...allNeeded].filter(p => !catalogIds.has(p));
+    const filteredOut = unresolved.filter(p => staleFilteredPids[p]);
+    const missingPids = unresolved.filter(p => !staleFilteredPids[p]);
+    if (filteredOut.length) {
+      console.warn(`[Step 4] ${filteredOut.length} dataset PIDs are in the catalog but were dropped by the 90-day filter. First 10:`, filteredOut.slice(0, 10));
       notifications.push({ type: 'warn',
-        text: `${missingPids.length} product ID${missingPids.length > 1 ? 's' : ''} in the dataset were not found in the catalog — those cards will show as "Product not in catalog". See console for the full list.` });
+        text: `${filteredOut.length} product ID${filteredOut.length > 1 ? 's' : ''} in the dataset are present in the catalog `
+            + `but were dropped by the 90-day updated_at filter, so they cannot be reviewed. Their cards say `
+            + `"Filtered out by the 90-day rule" with the age. Refresh the catalog, or raise `
+            + `HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
+    }
+    if (missingPids.length) {
+      console.warn(`[Step 4] ${missingPids.length} product IDs in dataset not present in the catalog file at all. First 10:`, missingPids.slice(0, 10));
+      notifications.push({ type: 'warn',
+        text: `${missingPids.length} product ID${missingPids.length > 1 ? 's' : ''} in the dataset are not present in the catalog file at all — those cards will show "Not in the index file". See console for the full list.` });
     }
 
     console.log('[QA Dashboard] Load complete ✅', {
@@ -1646,10 +1702,25 @@ function renderGrid() {
 
   grid.innerHTML = pids.map(pid => {
     const p = productIndex[pid];
-    if (!p) return `<div class="product-card" onclick="openModal('${pid}')">
-      <div class="card-image-wrap" style="display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:12px;">Product not in catalog</div>
-      <div class="card-body"><div class="card-title">${pid}</div></div>
-    </div>`;
+    if (!p) {
+      // Two very different reasons a product has no catalog entry, with two
+      // different fixes — say which one it is.
+      const staleAt = staleFilteredPids[pid];
+      const headline = staleAt ? 'Filtered out by the 90-day rule' : 'Not in the index file';
+      const detail   = staleAt
+        ? staleAgeLabel(staleAt)
+        : 'the index has no record for this id';
+      const title    = staleAt
+        ? `This product IS in the index file but its updated_at is outside the ${HISTORICAL_INDEX_MAX_AGE_DAYS}-day window (${staleAgeLabel(staleAt)}), so it was not loaded. Refresh the index to review it.`
+        : 'No record with this product_id was found in the index file.';
+      return `<div class="product-card card-unresolved ${staleAt ? 'card-stale' : 'card-absent'}" title="${escapeHtml(title)}">
+        <div class="card-image-wrap card-unresolved-wrap">
+          <div class="card-unresolved-headline">${headline}</div>
+          <div class="card-unresolved-detail">${escapeHtml(detail)}</div>
+        </div>
+        <div class="card-body"><div class="card-title">${escapeHtml(pid)}</div></div>
+      </div>`;
+    }
 
     const key = `${activeKeyword.keyword}::${pid}`;
     const isInStock  = isInStockPid(pid);
