@@ -1940,7 +1940,6 @@ mark.dump-highlight-active {
 }
 .card-unresolved-headline { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
 .card-unresolved-detail   { font-size: 11px; color: var(--text-muted); }
-.card-stale  .card-unresolved-headline { color: #d18f2e; }
 .card-absent .card-unresolved-headline { color: var(--text-muted); }
 
 .add-products-grade {

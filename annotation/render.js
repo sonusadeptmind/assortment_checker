@@ -12,8 +12,8 @@ const GRADE_LABEL = { 0: '0 (Not relevant)', 1: '1 (Relevant)', 2: '2 (Perfect)'
 /** Sidebar badge text for annotation mode: "12 · 4/6/2" (total · 0/1/2 counts).
  *  Falls back to plain total if no user selected or no labels exist. */
 function annRenderSidebarBadge(kw, user) {
-  const pids = kw.re_product_ids && kw.re_product_ids.length
-    ? kw.re_product_ids : kw.product_ids;
+  const pids = visiblePids(kw.re_product_ids && kw.re_product_ids.length
+    ? kw.re_product_ids : kw.product_ids);
   if (!user || !pids.length) return String(pids.length);
   const c = annCountGrades(user, kw.keyword, pids);
   if (c.labeled === 0) return String(pids.length);
@@ -49,8 +49,8 @@ function annRenderGradeBadge(grade, pid) {
 /** Update the annotation metrics pills (Total · Grade 0 · Grade 1 · Grade 2 · Labeled %). */
 function annUpdateMetrics(user) {
   if (!activeKeyword) return;
-  const pids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
-    ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  const pids = visiblePids(activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
+    ? activeKeyword.re_product_ids : activeKeyword.product_ids);
 
   const c = annCountGrades(user || '', activeKeyword.keyword, pids);
   const pct = c.total > 0 ? ((c.labeled / c.total) * 100).toFixed(1) + '%' : '—';
@@ -108,8 +108,8 @@ function annSetMode(mode) {
  *  Done state is implicit: keyword is done when all its products have grades. */
 function annUpdateQaDoneUI(user) {
   if (!activeKeyword) return;
-  const pids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
-    ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  const pids = visiblePids(activeKeyword.re_product_ids && activeKeyword.re_product_ids.length
+    ? activeKeyword.re_product_ids : activeKeyword.product_ids);
 
   const c      = annCountGrades(user || '', activeKeyword.keyword, pids);
   const isDone = c.total > 0 && c.labeled === c.total;

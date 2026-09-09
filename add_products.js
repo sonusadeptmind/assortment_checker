@@ -528,6 +528,17 @@ function confirmAddProducts() {
   activeKeyword.total = getBasePids().length;
   dumpFilterDirty = true;
 
+  // The filter pills were evaluated before these products existed, so
+  // filteredPids — the list the grid actually renders — does not contain them
+  // and the additions stay invisible, "Show Labeled" included.  Recompute, then
+  // put the just-added ids back regardless: they were picked deliberately in
+  // this dialog, and a filter written for the old set should not swallow them.
+  if (filteredPids) {
+    recomputeFilteredPids();
+    const shown = new Set(filteredPids);
+    pids.forEach(pid => { if (!shown.has(pid)) filteredPids.push(pid); });
+  }
+
   closeAddProductsModal();
   renderKeywordList();
   renderGrid();

@@ -4,14 +4,15 @@
  * Run with:  node tests/test_stale_message.js
  *
  * A product with no catalog entry has two possible causes with two different
- * fixes, and the grid used to call both "Product not in catalog":
+ * fixes, and the parse has to tell them apart:
  *   - it IS in the index file but its updated_at is outside the 90-day window
- *     → "Filtered out by the 90-day rule" (refresh the index)
+ *     → recorded in stalePids; the UI leaves the product out entirely
+ *       (covered by tests/test_hidden_products.js)
  *   - the index file has no record for that id at all
- *     → "Not in the index file"
+ *     → its card says "Not in the index file"
  *
- * _parseAnnotationJsonlStream, docPid and staleAgeLabel are pulled out of the
- * shipped app.js and run for real, over a real stream.
+ * _parseAnnotationJsonlStream and docPid are pulled out of the shipped app.js
+ * and run for real, over a real stream.
  *
  * Also asserts the parse now applies the 90-day filter and nothing else.
  */
@@ -60,14 +61,13 @@ vm.runInContext([
   extractFn(appSrc,  'function toBool(',                 'app.js'),
   extractFn(appSrc,  'function normalizeProductRecord(', 'app.js'),
   extractFn(appSrc,  'function docPid(',                 'app.js'),
-  extractFn(appSrc,  'function staleAgeLabel(',          'app.js'),
   extractFn(appSrc,  'async function _parseAnnotationJsonlStream(', 'app.js'),
   extractFn(dataSrc, 'function parseUpdatedAt(',         'annotation/data.js'),
   extractFn(dataSrc, 'function pickUpdatedAt(',          'annotation/data.js'),
   extractFn(dataSrc, 'function isRecentUpdate(',         'annotation/data.js'),
 ].join('\n\n'), sandbox);
 
-const { _parseAnnotationJsonlStream, docPid, staleAgeLabel } = sandbox;
+const { _parseAnnotationJsonlStream, docPid, parseUpdatedAt } = sandbox;
 
 //  Tiny runner
 let passed = 0, failed = 0;
@@ -83,7 +83,6 @@ function eq(label, actual, expected) {
 }
 
 const DAY = 864e5;
-const daysAgo = n => new Date(Date.now() - n * DAY).toISOString();
 
 //  docPid — every id shape the real indexes ship
 console.log('\n── docPid ────────────────────────────────────────────────');
@@ -97,18 +96,6 @@ eq('top level wins over the dump',
   docPid({ product_id: 'top', product_dump: { product_id: 'nested' } }), 'top');
 eq('no id at all → empty',  docPid({ title: 'no id here' }), '');
 eq('a non-object is tolerated', docPid(null), '');
-
-//  staleAgeLabel — the phrase the card shows
-console.log('── staleAgeLabel ─────────────────────────────────────────');
-assert('reports the age in days', /^last updated 18[12] days ago$/.test(staleAgeLabel(daysAgo(182))));
-eq('singular day', staleAgeLabel(daysAgo(1)), 'last updated 1 day ago');
-// The real gap index ships updated_at as a single-element array.
-assert('unwraps the array form retailers ship',
-  /^last updated 18[12] days ago$/.test(staleAgeLabel([daysAgo(182)])));
-eq('undated is called out, not silently zero',
-  staleAgeLabel(null), 'no usable updated_at');
-eq('an unparseable value is called out',
-  staleAgeLabel('whenever'), 'no usable updated_at');
 
 //  The parser reports which REQUESTED products the filter dropped
 console.log('── stale tracking through the real parser ────────────────');
@@ -149,9 +136,11 @@ const ALLOWED = ['fresh1', 'fresh2', 'stale1', 'stale2', 'neverInFile'];
     !('neverInFile' in r.stalePids));
   eq('every stale line is still counted', r.skippedStale, 3);
 
-  // The recorded value must be usable by the card.
-  assert('the reported value drives the age label',
-    /^last updated 18[12] days ago$/.test(staleAgeLabel(r.stalePids.stale1)));
+  // The recorded value is the raw updated_at, and has to stay parseable — the
+  // load notification and any future age reporting read it back.
+  const staleAt = parseUpdatedAt(r.stalePids.stale1);
+  assert('the recorded value is still a parseable date', staleAt !== null);
+  assert('and it is the old one', Math.round((Date.now() - staleAt.getTime()) / DAY) >= 181);
 
   // This is the reported bug: 785938 is in the file, 182 days old. It must be
   // reported as filtered, so the card can stop claiming it is not in the catalog.
@@ -172,12 +161,14 @@ const ALLOWED = ['fresh1', 'fresh2', 'stale1', 'stale2', 'neverInFile'];
   assert('nothing calls the parser with liveOnly',
     !/liveOnly:\s*true/.test(fs.readFileSync(path.join(ROOT, 'add_products.js'), 'utf-8')));
 
-  console.log('── the grid message distinguishes the two causes ─────────');
-  assert('card names the 90-day rule',      /Filtered out by the 90-day rule/.test(appSrc));
-  assert('card names the absent case',      /Not in the index file/.test(appSrc));
+  console.log('── filtered products are left out of the UI ──────────────');
+  // Behaviour lives in tests/test_hidden_products.js; these guard the wording.
+  assert('the absent case still has a card', /Not in the index file/.test(appSrc));
+  assert('no card claims the 90-day rule any more',
+    !/Filtered out by the 90-day rule/.test(appSrc));
   assert('the misleading message is gone',  !/>Product not in catalog</.test(appSrc));
-  assert('the card carries an explanatory tooltip',
-    /This product IS in the index file but its updated_at is outside/.test(appSrc));
+  assert('the load notification says they are left out of the grid',
+    /left out of the grid and its counts/.test(appSrc));
   assert('the load notification separates the two causes',
     /are not present in the index file at all/.test(appSrc));
   assert('a cache hit keeps the stale set',

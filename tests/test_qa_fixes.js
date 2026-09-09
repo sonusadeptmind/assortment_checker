@@ -94,6 +94,7 @@ const bundle = [
   extractFn(appSrc,  'function recomputeFilteredPids(', 'app.js'),
   extractFn(appSrc,  'function refreshAfterMarking(',  'app.js'),
   extractFn(addSrc,  'function productMatchesContentFilter(', 'add_products.js'),
+  extractFn(dataSrc, 'function visiblePids(',        'annotation/data.js'),
   extractFn(dataSrc, 'function annGetGrade(',        'annotation/data.js'),
   extractFn(dataSrc, 'function annSetGrade(',        'annotation/data.js'),
   extractFn(dataSrc, 'function annCountGrades(',     'annotation/data.js'),
