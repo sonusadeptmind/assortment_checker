@@ -55,6 +55,16 @@ function isRecentUpdate(value, maxAgeDays = HISTORICAL_INDEX_MAX_AGE_DAYS, nowMs
   return (nowMs - dt.getTime()) <= maxAgeDays * 24 * 60 * 60 * 1000;
 }
 
+/** Drop the products the 90-day filter removed from the index.  They have no
+ *  record to render and can never be graded, so the UI leaves them out of the
+ *  grid and of every count taken from it.  Export paths keep the full lists.
+ *  staleFilteredPids lives in app.js, which loads last — guarded so this file
+ *  still works on its own. */
+function visiblePids(pids) {
+  if (typeof staleFilteredPids === 'undefined') return pids || [];
+  return (pids || []).filter(pid => !staleFilteredPids[pid]);
+}
+
 /* 'iteration' (default) or 'annotation' — set by handleFolderLoad */
 let appMode = 'iteration';
 
@@ -190,8 +200,8 @@ function annReset() {
 /** Whether the active keyword is "done" for the active user (all rows graded). */
 function annIsKeywordDone(kw, user) {
   if (!user || !kw) return false;
-  const pids = kw.re_product_ids && kw.re_product_ids.length > 0
-    ? kw.re_product_ids : kw.product_ids;
+  const pids = visiblePids(kw.re_product_ids && kw.re_product_ids.length > 0
+    ? kw.re_product_ids : kw.product_ids);
   if (!pids.length) return false;
   const counts = annCountGrades(user, kw.keyword, pids);
   return counts.labeled === counts.total;

@@ -36,14 +36,16 @@ To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pa
 
 This is the **only** filter applied when an index is built — nothing is dropped for being out of stock. Out-of-stock products load normally and are shown with an **Out of Stock** ribbon so they can still be graded.
 
-### When a card has no product details
+### What happens to a product id that does not resolve
 
-A product id in the dataset can fail to resolve for two different reasons, and the grid names which one it is, because the fixes differ:
+A product id in the dataset can fail to resolve for two different reasons, and they are handled differently because the fixes differ:
 
-| Card says | Meaning | Fix |
+| Reason | What you see | Fix |
 |---|---|---|
-| **Filtered out by the 90-day rule** | The product *is* in the index file, but its `updated_at` is outside the window. The card shows the age (`last updated 182 days ago`). | Refresh the index, or raise `HISTORICAL_INDEX_MAX_AGE_DAYS`. |
-| **Not in the index file** | No record with that `product_id` exists in the file at all. | The index predates the product — regenerate it. |
+| **Dropped by the 90-day rule** — the product *is* in the index file, but its `updated_at` is outside the window | Nothing. There is no record to show and it can never be graded, so it is left out of the grid and of every count taken from it: the count chip, the sidebar badge, and the labeled/done denominators. A keyword whose only remaining ids are these still reaches 100%. | Refresh the index, or raise `HISTORICAL_INDEX_MAX_AGE_DAYS`. |
+| **Not in the index file** — no record with that `product_id` exists at all | A placeholder card reading **Not in the index file**. | The index predates the product — regenerate it. |
+
+Either way the id is untouched in exports; only the UI leaves it out.
 
 The load notification reports both counts separately, so you can tell a stale index from a genuinely missing product before opening a single keyword.
 
@@ -225,6 +227,8 @@ On first load a banner appears at the bottom of the screen prompting you to sele
 | 💾 Save | `outputs/qa_metadata.json`, `labels_store.json`, `iteration_history.json` | Full session state |
 | 📤 Import | — | Restore a saved `qa_metadata.json` |
 
+If any product on screen is still unlabelled, `📥 Export CSV` asks first — *"N products are still unlabelled. Export anyway?"* — so a half-reviewed set is never exported by accident. Products dropped by the 90-day filter are not in that count; they cannot be labelled.
+
 **Export CSV columns** (graded labels are bucketed for backwards-compatible TP / FP semantics):
 
 - `pids_to_include` — all PIDs graded **1** or **2** for the keyword (relevant)
@@ -336,7 +340,7 @@ The `retailer` column is lowercased and trimmed before matching against `{retail
 
 ### Output (export)
 
-`📥 Export CSV` writes back to `outputs/golden_dataset_labelled_desc.csv` (input filename preserved). Behavior:
+`📥 Export CSV` writes back to `outputs/golden_dataset_labelled_desc.csv` (input filename preserved). If any product on screen is still ungraded it asks for confirmation first, reporting how many. Behavior:
 
 1. Every input column is preserved verbatim.
 2. The active user's `{user}_*` columns are written from the in-memory store.

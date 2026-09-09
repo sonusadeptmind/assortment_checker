@@ -5,8 +5,9 @@ let keywords = [];
 let productIndex = {};
 let productDumps = {};
 /* pid → updated_at of products that ARE in the index file but were dropped by
-   the 90-day recency filter.  Kept so a card can say "filtered out, last
-   updated N days ago" instead of the misleading "not in catalog". */
+   the 90-day recency filter.  Kept so the load notification can report them
+   separately from ids the file has no record for, and so visiblePids can keep
+   them out of the grid and its counts. */
 let staleFilteredPids = {};
 let activeKeyword = null;      // current keyword object
 let disapprovals = {};          // { "keyword::pid": {reason, attribute, ...} }
@@ -176,8 +177,8 @@ function normalizeProductRecord(raw, pid) {
 /* Return the review-set PID list for the active keyword. */
 function getBasePids() {
   if (!activeKeyword) return [];
-  return (activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
-    ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  return visiblePids((activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
+    ? activeKeyword.re_product_ids : activeKeyword.product_ids);
 }
 
 /** PID for a raw JSONL doc: top level first, product_dump as fallback.
@@ -188,14 +189,6 @@ function docPid(doc) {
     ? doc.product_dump : null;
   return toStr(doc.product_id || doc.id || doc._id
     || (dump && (dump.product_id || dump.id)));
-}
-
-/** How stale a dropped product is, as a human phrase for the card/tooltip. */
-function staleAgeLabel(updatedAt) {
-  const dt = (typeof parseUpdatedAt === 'function') ? parseUpdatedAt(updatedAt) : null;
-  if (!dt) return 'no usable updated_at';
-  const days = Math.floor((Date.now() - dt.getTime()) / 86400000);
-  return `last updated ${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 /** Strict whole-word match (word-boundary regex).
@@ -326,7 +319,7 @@ function updateRetailerProgress() {
   let doneKws = 0;
   const totalKws = keywords.length;
   keywords.forEach(kw => {
-    const pids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
+    const pids = visiblePids((kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids);
     if (pids.length === 0) return;
     const labeled = appMode === 'annotation'
       ? annCountGrades(currentUser, kw.keyword, pids).labeled
@@ -765,11 +758,16 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
  *  and naming drift.  Shared by the annotation loader and the Add Products
  *  full-live-index loader (add_products.js). */
 function findHistoricalIndexFile(files, retailer) {
-  const jsonlFiles = files.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
+  // A zero-byte file can never be the index.  Folders often carry an empty
+  // stub next to the real index (gap.jsonl beside gap_gap.jsonl.gz) and both
+  // match the retailer, so without this the stub wins on enumeration order
+  // and every product id looks absent from the catalog.
+  const usable     = files.filter(f => f.size > 0);
+  const jsonlFiles = usable.filter(f => f.name.endsWith('.jsonl') || f.name.endsWith('.jsonl.gz'));
   const exact      = `${retailer}_historical_index.jsonl`;
   return (
-    files.find(f => f.name === exact) ||
-    files.find(f => f.name.toLowerCase() === exact) ||
+    usable.find(f => f.name === exact) ||
+    usable.find(f => f.name.toLowerCase() === exact) ||
     jsonlFiles.find(f => f.name.toLowerCase().includes(retailer)) ||
     (jsonlFiles.length === 1 ? jsonlFiles[0] : null)
   );
@@ -951,7 +949,7 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
         notifications.push({ type: 'warn',
           text: `${wantedStale} of the ${allowedPids.length} products this dataset asks for are in `
               + `"${indexFile.name}" but were dropped by the 90-day updated_at filter, so they cannot `
-              + `be reviewed. Their cards say "Filtered out by the 90-day rule" with the age. `
+              + `be reviewed and are left out of the grid and its counts. `
               + `Refresh the index, or raise HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
       }
     }
@@ -1540,8 +1538,8 @@ async function handleFolderLoad(dirHandle) {
       console.warn(`[Step 4] ${filteredOut.length} dataset PIDs are in the catalog but were dropped by the 90-day filter. First 10:`, filteredOut.slice(0, 10));
       notifications.push({ type: 'warn',
         text: `${filteredOut.length} product ID${filteredOut.length > 1 ? 's' : ''} in the dataset are present in the catalog `
-            + `but were dropped by the 90-day updated_at filter, so they cannot be reviewed. Their cards say `
-            + `"Filtered out by the 90-day rule" with the age. Refresh the catalog, or raise `
+            + `but were dropped by the 90-day updated_at filter, so they cannot be reviewed and are left `
+            + `out of the grid and its counts. Refresh the catalog, or raise `
             + `HISTORICAL_INDEX_MAX_AGE_DAYS, to bring them back.` });
     }
     if (missingPids.length) {
@@ -1593,7 +1591,7 @@ function renderKeywordList() {
         ? annIsKeywordDone(kw, currentUser)
         : qaDoneKeywords.has(kw.keyword);
 
-      const basePids = (kw.re_product_ids && kw.re_product_ids.length > 0) ? kw.re_product_ids : kw.product_ids;
+      const basePids = visiblePids((kw.re_product_ids && kw.re_product_ids.length > 0) ? kw.re_product_ids : kw.product_ids);
       const total = basePids.length;
 
       // Progress bar and badge differ by mode
@@ -1653,8 +1651,8 @@ function renderGrid() {
 
   const showLabels = showLabelsActive;
 
-  const basePids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0
-                   ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  const basePids = visiblePids(activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0
+                   ? activeKeyword.re_product_ids : activeKeyword.product_ids);
   let pids = filteredPids || basePids;
 
   // When "Prior Iterations" is on, surface historical labeled PIDs (tp_ids /
@@ -1662,10 +1660,10 @@ function renderGrid() {
   const priorSet = new Set();
   if (showPriorActive) {
     const reviewSet = new Set(pids);
-    const historical = [...new Set([
+    const historical = visiblePids([...new Set([
       ...(activeKeyword.tp_ids || []),
       ...(activeKeyword.fp_ids || []),
-    ])].filter(pid => !reviewSet.has(pid));
+    ])]).filter(pid => !reviewSet.has(pid));
     historical.forEach(pid => priorSet.add(pid));
     if (historical.length) pids = [...pids, ...historical];
   }
@@ -1703,20 +1701,14 @@ function renderGrid() {
   grid.innerHTML = pids.map(pid => {
     const p = productIndex[pid];
     if (!p) {
-      // Two very different reasons a product has no catalog entry, with two
-      // different fixes — say which one it is.
-      const staleAt = staleFilteredPids[pid];
-      const headline = staleAt ? 'Filtered out by the 90-day rule' : 'Not in the index file';
-      const detail   = staleAt
-        ? staleAgeLabel(staleAt)
-        : 'the index has no record for this id';
-      const title    = staleAt
-        ? `This product IS in the index file but its updated_at is outside the ${HISTORICAL_INDEX_MAX_AGE_DAYS}-day window (${staleAgeLabel(staleAt)}), so it was not loaded. Refresh the index to review it.`
-        : 'No record with this product_id was found in the index file.';
-      return `<div class="product-card card-unresolved ${staleAt ? 'card-stale' : 'card-absent'}" title="${escapeHtml(title)}">
+      // Products dropped by the 90-day filter never get here — visiblePids
+      // takes them out of the grid.  What is left is an id the index file has
+      // no record for at all, which needs a regenerated index, not a refresh.
+      const title = 'No record with this product_id was found in the index file.';
+      return `<div class="product-card card-unresolved card-absent" title="${escapeHtml(title)}">
         <div class="card-image-wrap card-unresolved-wrap">
-          <div class="card-unresolved-headline">${headline}</div>
-          <div class="card-unresolved-detail">${escapeHtml(detail)}</div>
+          <div class="card-unresolved-headline">Not in the index file</div>
+          <div class="card-unresolved-detail">the index has no record for this id</div>
         </div>
         <div class="card-body"><div class="card-title">${escapeHtml(pid)}</div></div>
       </div>`;
@@ -1824,8 +1816,8 @@ function renderGrid() {
 function updateMetrics() {
   if (!activeKeyword) return;
   if (appMode === 'annotation') { annUpdateMetrics(currentUser); return; }
-  const basePids = (activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
-                   ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  const basePids = visiblePids((activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0)
+                   ? activeKeyword.re_product_ids : activeKeyword.product_ids);
   const total = basePids.length;
   let approved = 0, disapproved = 0;
   basePids.forEach(pid => {
@@ -2442,12 +2434,41 @@ function bulkApprove() {
 
 // EXPORT CSV / SAVE METADATA / IMPORT
 
+/** Products still waiting for a label across the loaded keywords.  Counts only
+ *  what the grid shows — a product the 90-day filter dropped can never be
+ *  graded, so it must not sit in this number forever.  Scope is the loaded
+ *  retailer, the same set the sidebar reports progress for. */
+function countUnlabeledProducts() {
+  let n = 0;
+  keywords.forEach(kw => {
+    const pids = visiblePids(kw.re_product_ids && kw.re_product_ids.length
+      ? kw.re_product_ids : kw.product_ids);
+    pids.forEach(pid => {
+      const key = `${kw.keyword}::${pid}`;
+      const unlabeled = appMode === 'annotation'
+        ? annGetGrade(currentUser, kw.keyword, pid) === null
+        : !approvals[key] && !disapprovals[key];
+      if (unlabeled) n++;
+    });
+  });
+  return n;
+}
+
 async function exportDisapprovals() {
   if (keywords.length === 0) { alert('No data loaded.'); return; }
+  // Hoisted out of the annotation branch below: the unlabeled count needs a user.
+  if (appMode === 'annotation' && !currentUser) {
+    showUserBanner(); showToast('Select your name before exporting.', 'error'); return;
+  }
+
+  const unlabeled = countUnlabeledProducts();
+  if (unlabeled > 0 && !confirm(
+      `${unlabeled} product${unlabeled === 1 ? ' is' : 's are'} still unlabelled. Export anyway?`)) {
+    return;
+  }
 
   // Annotation mode export
   if (appMode === 'annotation') {
-    if (!currentUser) { showUserBanner(); showToast('Select your name before exporting.', 'error'); return; }
     const csvContent = annBuildExportCSV(goldenHeaders, goldenRows, currentUser);
     let saved = false;
     if (clientFolderHandle) {
@@ -3101,8 +3122,8 @@ function updateQaDoneUI() {
   document.getElementById('qaMarkDoneBtn').style.display = isDone ? 'none' : 'inline-flex';
   document.getElementById('qaRevertBtn').style.display = isDone ? 'inline-flex' : 'none';
 
-  const basePids = activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0
-                   ? activeKeyword.re_product_ids : activeKeyword.product_ids;
+  const basePids = visiblePids(activeKeyword.re_product_ids && activeKeyword.re_product_ids.length > 0
+                   ? activeKeyword.re_product_ids : activeKeyword.product_ids);
   let disapproved = 0;
   basePids.forEach(pid => {
     if (disapprovals[`${activeKeyword.keyword}::${pid}`]) disapproved++;

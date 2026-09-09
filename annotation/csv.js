@@ -288,7 +288,7 @@ function annBuildLabelsStore() {
 function annBuildKeywordMetricsStore(user) {
   if (!user || !keywords || !keywords.length) return [];
   return keywords.map(kw => {
-    const pids   = kw.re_product_ids && kw.re_product_ids.length ? kw.re_product_ids : kw.product_ids;
+    const pids   = visiblePids(kw.re_product_ids && kw.re_product_ids.length ? kw.re_product_ids : kw.product_ids);
     const counts = annCountGrades(user, kw.keyword, pids);
     return {
       keyword:       kw.keyword,
