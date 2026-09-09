@@ -440,3 +440,141 @@ def test_evaluate_keyword_tp_dropped_in_stock_tracked(evaluate_keyword_fn):
         catalog=catalog,
     )
     assert "p2" in result["tp_dropped_in_stock"]
+
+
+# ── OOS policy (mirrors the dashboard's load-time include/exclude choice) ──
+
+
+@pytest.fixture
+def oos_fns():
+    pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    from evaluate_iteration import compute_oos_excluded, OOS_MAX_AGE_DAYS
+    return compute_oos_excluded, OOS_MAX_AGE_DAYS
+
+
+def _write_catalog(tmp_path, rows):
+    """rows: (pid, in_stock, age_days). Writes one JSONL line each."""
+    now = datetime.now(timezone.utc)
+    path = tmp_path / "catalog.jsonl"
+    with open(path, "w") as f:
+        for pid, in_stock, age_days in rows:
+            f.write(json.dumps({
+                "product_id": pid,
+                "product_liveness": in_stock,
+                "updated_at": (now - timedelta(days=age_days)).isoformat(),
+            }) + "\n")
+    return str(path)
+
+
+def test_compute_oos_excluded_include_keeps_fresh_oos(tmp_path, oos_fns):
+    compute_oos_excluded, _ = oos_fns
+    path = _write_catalog(tmp_path, [
+        ("live", True, 1),
+        ("oos_fresh", False, 5),
+        ("oos_stale", False, 45),
+    ])
+    excluded = compute_oos_excluded(path, {}, policy="include")
+    assert excluded == {"oos_stale": "oos_stale"}
+
+
+def test_compute_oos_excluded_exclude_drops_every_oos(tmp_path, oos_fns):
+    compute_oos_excluded, _ = oos_fns
+    path = _write_catalog(tmp_path, [
+        ("live", True, 1),
+        ("oos_fresh", False, 5),
+        ("oos_stale", False, 45),
+    ])
+    excluded = compute_oos_excluded(path, {}, policy="exclude")
+    assert excluded == {"oos_fresh": "oos_excluded", "oos_stale": "oos_excluded"}
+
+
+def test_compute_oos_excluded_never_drops_a_labelled_product(tmp_path, oos_fns):
+    """Only annotated products are evaluated — an annotation is never discarded."""
+    compute_oos_excluded, _ = oos_fns
+    path = _write_catalog(tmp_path, [("oos_stale", False, 45), ("oos_other", False, 45)])
+    label_store = _make_label_store("shoes", {"oos_stale"}, set())
+    excluded = compute_oos_excluded(path, label_store, policy="include")
+    assert "oos_stale" not in excluded
+    assert excluded == {"oos_other": "oos_stale"}
+    # ...and the same holds in exclude mode.
+    excluded = compute_oos_excluded(path, label_store, policy="exclude")
+    assert "oos_stale" not in excluded
+
+
+def test_compute_oos_excluded_window_is_configurable(tmp_path, oos_fns):
+    compute_oos_excluded, default_days = oos_fns
+    assert default_days == 30
+    path = _write_catalog(tmp_path, [("oos", False, 20)])
+    assert compute_oos_excluded(path, {}, policy="include") == {}
+    assert compute_oos_excluded(path, {}, policy="include", oos_max_age_days=10) == {
+        "oos": "oos_stale"
+    }
+
+
+def test_evaluate_keyword_excludes_oos_from_every_input(evaluate_keyword_fn):
+    """An out-of-scope product must not move precision, recall or the counts."""
+    label_store = _make_label_store("shoes", {"p1"}, {"p2"})
+    catalog = {"p1": True, "p2": True, "dead": False}
+
+    kwargs = dict(
+        keyword="shoes",
+        current_prod_ids={"p1", "p2", "dead"},
+        current_pids_to_include={"p1"},
+        current_pids_to_remove={"p2"},
+        current_re={"p1", "p2", "dead"},
+        new_product_ids={"p1", "p2", "dead"},
+        label_store=label_store,
+        iteration_num=2,
+        catalog=catalog,
+    )
+    without = evaluate_keyword_fn(**kwargs, oos_excluded={"dead": "oos_stale"})
+    # 1 TP + 1 FP over the two in-scope products.
+    assert without["labeled_precision"] == 0.5
+    assert without["new_result_count"] == 2
+    assert without["unknown_count"] == 0          # "dead" no longer counts as unknown
+    assert without["oos_excluded_count"] == 1
+    assert without["oos_excluded_pids"] == "dead"
+
+    # Leaving it in scope makes it an unlabelled result, dragging coverage down.
+    with_it = evaluate_keyword_fn(**kwargs)
+    assert with_it["unknown_count"] == 1
+    assert with_it["oos_excluded_count"] == 0
+    assert with_it["label_coverage"] < without["label_coverage"]
+
+
+def test_evaluate_keyword_oos_excluded_defaults_to_no_op(evaluate_keyword_fn):
+    """Omitting the argument keeps the previous behaviour exactly."""
+    label_store = _make_label_store("shoes", {"p1"}, set())
+    catalog = {"p1": True}
+    base = dict(
+        keyword="shoes",
+        current_prod_ids={"p1"},
+        current_pids_to_include={"p1"},
+        current_pids_to_remove=set(),
+        current_re={"p1"},
+        new_product_ids={"p1"},
+        label_store=label_store,
+        iteration_num=2,
+        catalog=catalog,
+    )
+    assert evaluate_keyword_fn(**base) == evaluate_keyword_fn(**base, oos_excluded={})
+
+
+def test_evaluate_keyword_reports_only_relevant_exclusions(evaluate_keyword_fn):
+    """A product excluded globally but unrelated to this keyword isn't reported."""
+    label_store = _make_label_store("shoes", {"p1"}, set())
+    result = evaluate_keyword_fn(
+        keyword="shoes",
+        current_prod_ids={"p1"},
+        current_pids_to_include={"p1"},
+        current_pids_to_remove=set(),
+        current_re={"p1"},
+        new_product_ids={"p1"},
+        label_store=label_store,
+        iteration_num=2,
+        catalog={"p1": True},
+        oos_excluded={"belongs_to_another_keyword": "oos_stale"},
+    )
+    assert result["oos_excluded_count"] == 0
+    assert result["oos_excluded_pids"] == ""

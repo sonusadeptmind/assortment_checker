@@ -190,12 +190,9 @@ function annReset() {
 /** Whether the active keyword is "done" for the active user (all rows graded). */
 function annIsKeywordDone(kw, user) {
   if (!user || !kw) return false;
-  const basePids = kw.re_product_ids && kw.re_product_ids.length > 0
+  const pids = kw.re_product_ids && kw.re_product_ids.length > 0
     ? kw.re_product_ids : kw.product_ids;
-  if (!basePids.length) return false;
-  // OOS products are unjudgeable and never block completion (app.js helper).
-  const pids = typeof progressPids === 'function' ? progressPids(basePids) : basePids;
-  if (!pids.length) return true;   // every product is OOS → nothing left to grade
+  if (!pids.length) return false;
   const counts = annCountGrades(user, kw.keyword, pids);
   return counts.labeled === counts.total;
 }

@@ -3,9 +3,10 @@
  *
  * Run with:  node tests/test_live_only_filter.js
  *
- * Replicates the exact filtering branch used in both load paths in app.js:
- *   - _parseAnnotationJsonlStream golden branch  (liveOnly: keepLiveOnly)
- *   - the catalog/review JSONL + pre-built-index loops
+ * Covers the liveness derivation itself and the plain "drop dead records"
+ * filter built on top of it.  The load-time policy that decides *when* that
+ * filter runs (include-with-30-day-window vs. exclude) lives in
+ * tests/test_oos_policy_load.js.
  *
  * Invariants verified:
  *   - liveOnly=false  → historical index unchanged; every record kept, dead

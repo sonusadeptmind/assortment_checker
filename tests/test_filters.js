@@ -109,27 +109,15 @@ function removeFilter(idx) {
   recomputeFilteredPids();
 }
 
-/* ── OOS helpers (from app.js) ── */
-function isPidOutOfStock(pid, index) {
-  const entry = (index || productIndex)[pid];
-  return entry !== undefined && entry.liveness === false;
-}
-function progressPids(pids, index) {
-  return (pids || []).filter(pid => !isPidOutOfStock(pid, index));
-}
-
-/* ── Retailer progress (inline of updateRetailerProgress logic) ──
-   OOS products are excluded: they can't be graded, so they must not keep a
-   keyword out of the "checked" count. */
+/* ── Retailer progress (inline of updateRetailerProgress logic) ── */
 function computeRetailerProgress(keywords, user) {
   let doneKws = 0;
   const totalKws = keywords.length;
   keywords.forEach(kw => {
-    const basePids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
-    if (basePids.length === 0) return;
-    const pids = progressPids(basePids);
-    if (pids.length === 0) { doneKws++; return; }   // every product is OOS → nothing to check
-    if (annCountGrades(user, kw.keyword, pids).labeled === pids.length) doneKws++;
+    const pids = (kw.re_product_ids && kw.re_product_ids.length) ? kw.re_product_ids : kw.product_ids;
+    if (pids.length > 0 && annCountGrades(user, kw.keyword, pids).labeled === pids.length) {
+      doneKws++;
+    }
   });
   const pct = totalKws > 0 ? parseFloat((doneKws / totalKws * 100).toFixed(1)) : 0;
   return { doneKws, totalKws, pct };
@@ -451,41 +439,6 @@ r = computeRetailerProgress([KW_A], 'sonus'); // sonus has no grades
 eq("other user's grades don't count for sonus → 0 done", r.doneKws, 0);
 r = computeRetailerProgress([KW_A], 'lisha'); // lisha has all grades
 eq("lisha's own grades count → 1 done", r.doneKws, 1);
-
-console.log('── computeRetailerProgress: OOS products excluded ───────');
-
-// Catalog: p2 is dead stock, everything else is live.
-productIndex = {
-  p1: { liveness: true }, p2: { liveness: false },
-  p3: { liveness: true }, p4: { liveness: false },
-};
-
-// KW_A = [p1, p2].  Grade only the in-stock p1 — the ungraded OOS p2 used to
-// keep this keyword out of the count forever.
-gradedLabels = { sonus: { 'shoes::p1': { grade: 1 } } };
-r = computeRetailerProgress([KW_A], 'sonus');
-eq('in-stock product graded, OOS leftover → keyword counts as done', r.doneKws, 1);
-eq('OOS leftover → 100%', r.pct, 100.0);
-
-// A keyword whose every product is OOS has nothing left to check.
-const KW_DEAD = { keyword: 'clogs', product_ids: ['p2', 'p4'], re_product_ids: [] };
-gradedLabels = {};
-r = computeRetailerProgress([KW_DEAD], 'sonus');
-eq('all-OOS keyword counts as done', r.doneKws, 1);
-
-// Ungraded in-stock products still block completion.
-gradedLabels = {};
-r = computeRetailerProgress([KW_A], 'sonus');
-eq('ungraded in-stock product still blocks the keyword', r.doneKws, 0);
-
-// Mixed: one keyword finished apart from OOS, one genuinely unfinished.
-gradedLabels = { sonus: { 'shoes::p1': { grade: 1 } } };
-r = computeRetailerProgress([KW_A, KW_B], 'sonus');   // KW_B = [p3], ungraded and live
-eq('mixed OOS/unfinished → 1 of 2 done', r.doneKws, 1);
-eq('mixed OOS/unfinished → 50%', r.pct, 50.0);
-
-// Back to an all-live catalog for anything that follows.
-productIndex = {};
 
 // grade=null entry (should not count as labeled)
 gradedLabels = { sonus: { 'shoes::p1': { grade: null }, 'shoes::p2': { grade: 2 } } };

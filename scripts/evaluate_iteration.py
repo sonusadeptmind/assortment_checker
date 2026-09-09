@@ -28,6 +28,8 @@ from openpyxl.utils import get_column_letter
 
 from utils import (
     DEFAULT_MAX_AGE_DAYS,
+    _doc_updated_at,
+    is_recent_update,
     iter_catalog_records,
     parse_pid_list,
     safe_round,
@@ -36,6 +38,21 @@ from utils import (
 SEP = "|"          # separator used when writing PID lists to cells
 LABEL_TP = "TP"
 LABEL_FP = "FP"
+
+# Out-of-stock policy — mirrors the dashboard (app.js OOS_MAX_AGE_DAYS).
+#   "include" (default): an OOS product stays in consideration while it is
+#       still fresh, i.e. updated_at within OOS_MAX_AGE_DAYS.  High-turnover
+#       retailers churn stock constantly, so something that has only just gone
+#       out is still worth judging.
+#   "exclude": every OOS product leaves consideration.
+# In either mode a product is only actually dropped when NOBODY LABELLED IT.
+# A human annotation is signal we never discard: a labelled OOS product keeps
+# its existing OOS-aware treatment (tp_dropped_oos, stock_adj_*).  An unlabelled
+# one was never reviewable in the dashboard, so counting it here would penalise
+# the model for a product no human could ever judge.
+OOS_MAX_AGE_DAYS = 30
+OOS_POLICY_INCLUDE = "include"
+OOS_POLICY_EXCLUDE = "exclude"
 
 
 def pids_to_str(pids: set) -> str:
@@ -119,6 +136,48 @@ def load_catalog(
     return liveness
 
 
+def compute_oos_excluded(
+    path: str,
+    label_store: dict,
+    *,
+    policy: str = OOS_POLICY_INCLUDE,
+    oos_max_age_days: int = OOS_MAX_AGE_DAYS,
+    max_age_days: Optional[int] = DEFAULT_MAX_AGE_DAYS,
+    now: Optional[datetime] = None,
+) -> dict[str, str]:
+    """Map ``{product_id: reason}`` for OOS products removed from consideration.
+
+    Mirrors the dashboard's load-time OOS policy so a report and the UI that
+    produced its labels always agree on what was in scope.
+
+    Reasons are ``"oos_excluded"`` (policy is ``exclude``) and ``"oos_stale"``
+    (policy is ``include`` but ``updated_at`` is missing or older than
+    ``oos_max_age_days``).
+
+    A product carrying any label in ``label_store`` is never dropped — only
+    annotated products are evaluated, and an annotation is evidence a human
+    did review it.
+    """
+    labelled: set[str] = set()
+    for kw_labels in (label_store or {}).values():
+        labelled.update(str(pid) for pid in kw_labels)
+
+    excluded: dict[str, str] = {}
+    for _line_num, obj in iter_catalog_records(path, max_age_days=max_age_days, now=now):
+        pid = str(obj.get("product_id", "")).strip()
+        if not pid or pid in labelled:
+            continue
+        if bool(obj.get("product_liveness", True)):
+            continue                                   # in stock — always kept
+        if policy == OOS_POLICY_EXCLUDE:
+            excluded[pid] = "oos_excluded"
+        elif not is_recent_update(
+            _doc_updated_at(obj), max_age_days=oos_max_age_days, now=now
+        ):
+            excluded[pid] = "oos_stale"
+    return excluded
+
+
 def load_iteration_history(path: str) -> list:
     """Load the iteration aggregate-history list, or ``[]`` if absent."""
     if os.path.exists(path):
@@ -179,6 +238,7 @@ def evaluate_keyword(
     iteration_num:          int,
     catalog:                dict,  # {product_id: bool} — True = in-stock
     traffic:                str = "",
+    oos_excluded:           Optional[dict] = None,  # {pid: reason} out of scope
 ) -> dict:
     """Evaluate a single keyword across the previous and new model iterations.
 
@@ -196,11 +256,30 @@ def evaluate_keyword(
         iteration_num: Current 1-based iteration number.
         catalog: Product liveness map {product_id: bool} (True = in-stock).
         traffic: Optional traffic volume string for this keyword.
+        oos_excluded: {product_id: reason} for unlabelled out-of-stock products
+            the OOS policy removed from consideration. They are stripped from
+            every input set before any metric is computed, so precision and
+            recall are measured over exactly the products a reviewer could see.
 
     Returns:
         Dict containing all computed metrics, alert strings, and updated
         dataset column values (prefixed with '_').
     """
+    # OOS products the policy put out of scope never reach any metric. They are
+    # removed up front — from the model output as well as the previous-iteration
+    # sets — so nothing downstream has to remember to special-case them.
+    out_of_scope = set(oos_excluded or {})
+    kw_oos_excluded = out_of_scope & (
+        current_prod_ids | current_re | new_product_ids | current_pids_to_include
+        | current_pids_to_remove
+    )
+    if out_of_scope:
+        current_prod_ids        = current_prod_ids        - out_of_scope
+        current_pids_to_include = current_pids_to_include - out_of_scope
+        current_pids_to_remove  = current_pids_to_remove  - out_of_scope
+        current_re              = current_re              - out_of_scope
+        new_product_ids         = new_product_ids         - out_of_scope
+
     kw_labels = label_store.get(keyword, {})
     known_tps  = {pid for pid, m in kw_labels.items() if m["label"] == LABEL_TP}
     known_fps  = {pid for pid, m in kw_labels.items() if m["label"] == LABEL_FP}
@@ -354,6 +433,10 @@ def evaluate_keyword(
         # unlabeled flag
         "unlabeled_flag":       "⚠ YES" if unlabeled_flag else "",
         "unlabeled_ratio":      safe_round(unlabeled_ratio),
+
+        # out-of-scope products (OOS policy) — reported, never scored
+        "oos_excluded_count":   len(kw_oos_excluded),
+        "oos_excluded_pids":    pids_to_str(kw_oos_excluded),
 
         # alert / detail strings
         "tp_dropped_in_stock":  pids_to_str(tp_dropped_in_stock),
@@ -553,6 +636,7 @@ def generate_report(results: list, iteration_num: int, output_dir: str,
         "stock_adj_precision", "stock_adj_recall", "stock_adj_f1",
         "label_coverage", "tp_retention_rate", "fp_elimination_rate",
         "unlabeled_flag", "unlabeled_ratio",
+        "oos_excluded_count", "oos_excluded_pids",
         "tp_dropped_in_stock", "tp_dropped_oos",
         "fp_eliminated", "fp_remaining",
     ]
@@ -697,6 +781,7 @@ def generate_keyword_breakdown_csv(results: list, iteration_num: int,
         "stock_adj_precision", "stock_adj_recall", "stock_adj_f1",
         "label_coverage", "tp_retention_rate", "fp_elimination_rate",
         "unlabeled_flag", "unlabeled_ratio",
+        "oos_excluded_count", "oos_excluded_pids",
         "tp_dropped_in_stock", "tp_dropped_oos",
         "fp_eliminated", "fp_remaining",
     ]
@@ -724,6 +809,14 @@ def main():
                         help="Path to persistent label store JSON")
     parser.add_argument("--history",       default="iteration_history.json",
                         help="Path to iteration aggregate history JSON")
+    parser.add_argument("--oos_policy", choices=[OOS_POLICY_INCLUDE, OOS_POLICY_EXCLUDE],
+                        default=OOS_POLICY_INCLUDE,
+                        help="How to treat out-of-stock products, mirroring the dashboard "
+                             f"prompt. 'include' (default) keeps an OOS product whose "
+                             f"updated_at is within --oos_max_age_days; 'exclude' drops "
+                             "every OOS product. Labelled products are never dropped.")
+    parser.add_argument("--oos_max_age_days", type=int, default=OOS_MAX_AGE_DAYS,
+                        help=f"Freshness window for 'include' OOS policy (default {OOS_MAX_AGE_DAYS})")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -736,10 +829,24 @@ def main():
     label_store              = load_label_store(args.label_store)
     history                  = load_iteration_history(args.history)
 
+    # Which unlabelled OOS products the policy puts out of scope. Computed from
+    # the same catalog the metrics read, so the report and the dashboard that
+    # produced the labels agree on what was reviewable.
+    oos_excluded = compute_oos_excluded(
+        args.catalog, label_store,
+        policy=args.oos_policy, oos_max_age_days=args.oos_max_age_days,
+    )
+
     print(f"   dataset.csv         : {len(dataset_df)} keywords")
     print(f"   Combined Final Data : {len(combined_df)} rows")
     print(f"   Removed Candidates  : {len(removed_df)} rows")
     print(f"   catalog.jsonl       : {len(catalog)} products ({sum(1 for v in catalog.values() if not v)} OOS)")
+    if oos_excluded:
+        window = "" if args.oos_policy == OOS_POLICY_EXCLUDE else f" (updated_at older than {args.oos_max_age_days}d)"
+        print(f"   OOS policy '{args.oos_policy}'  : {len(oos_excluded)} unlabelled OOS products "
+              f"removed from consideration{window}")
+    else:
+        print(f"   OOS policy '{args.oos_policy}'  : nothing removed from consideration")
 
     # 2. Build new-iteration lookup map
     new_iter_map: dict[str, set] = {}
@@ -796,6 +903,7 @@ def main():
             iteration_num           = args.iteration_num,
             catalog                 = catalog,
             traffic                 = traffic_map.get(kw, ""),
+            oos_excluded            = oos_excluded,
         )
         result["manual_qa_status"] = str(row.get("manual_qa_status", "")).strip().upper() == "TRUE"
         results.append(result)
@@ -813,6 +921,7 @@ def main():
             iteration_num           = args.iteration_num,
             catalog                 = catalog,
             traffic                 = traffic_map.get(kw, ""),
+            oos_excluded            = oos_excluded,
         )
         result["manual_qa_status"] = False  # brand-new keyword, not yet QA'd
         results.append(result)
@@ -858,6 +967,19 @@ def main():
         "fp_elimination_rate": current_agg.get("fp_elimination_rate"),
         "keywords_evaluated":  len(results),
         "total_pids_to_check": current_agg.get("pids_to_check_count"),
+        # Out-of-scope products, spelled out so a reader of this file can tell a
+        # product the model got wrong from one nobody could review.
+        "oos_policy": {
+            "mode": args.oos_policy,
+            "max_age_days": args.oos_max_age_days,
+        },
+        "oos_excluded_count": len(oos_excluded),
+        "oos_excluded_product_ids": sorted(oos_excluded),
+        "oos_excluded_reasons": {pid: reason for pid, reason in sorted(oos_excluded.items())},
+        "oos_excluded_note": (
+            f"{len(oos_excluded)} unlabelled out-of-stock product(s) were not considered "
+            f"in this evaluation under OOS policy '{args.oos_policy}'."
+        ),
     }
     history.append(history_entry)
     save_iteration_history(history, args.history)

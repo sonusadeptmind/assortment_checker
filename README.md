@@ -36,14 +36,30 @@ To tune or disable the filter for `build_index.py` / `evaluate_iteration.py`, pa
 
 ---
 
-## Product liveness filter (both modes)
+## Out-of-stock (OOS) policy (both modes)
 
-When you load a folder that contains a historical index, the dashboard asks **"Keep only live products?"** before it builds the index:
+When you load a folder that contains a historical index, the dashboard asks **"Include out-of-stock products?"** before it builds the index:
 
-- **Yes — live only** — only records whose `product_liveness` / `liveness` is `true` are kept; dead products and variants are dropped. The load notification reports how many were dropped.
-- **No — use full index** — the full historical index is used unchanged.
+- **Include OOS (default)** — an out-of-stock product stays in consideration while it is still *fresh*: `updated_at` within the last **30 days**. High-turnover retailers churn stock constantly, so something that has only just gone out is still worth judging; anything dead longer than that is dropped. An OOS record with no parseable `updated_at` cannot be shown to be fresh, so it is dropped too.
+- **Exclude OOS** — every out-of-stock product is dropped.
 
-The prompt appears once per load, is decided fresh every time (it is **not** remembered), and applies to both the annotation and iteration/catalog load paths. It is independent of the 90-day recency filter above — both can apply to the same load.
+In-stock products are never touched by this policy. The prompt appears once per load, is decided fresh every time (it is **not** remembered), and applies to both the annotation and iteration/catalog load paths. It is independent of the 90-day recency filter above — both apply to the same load, and for OOS products the 30-day window is the stricter of the two.
+
+### Removed from consideration means removed everywhere
+
+A dropped product never enters the index, and its id is then stripped from every list the keyword is evaluated on — `product_ids`, `re_product_ids`, `prev_re_ids`, `new_iteration_ids`, `staging_ids`, `tp_ids`, `fp_ids`. So it does not appear in the grid, does not sit in the denominator of the keyword progress bar, does not hold a keyword back from the `N / M keywords fully QA'd` count, and does not enter precision/recall. Metrics are measured over exactly the products a reviewer could actually see.
+
+### Traceability
+
+Every dropped id is written to `qa_metadata.json`:
+
+```json
+"oos_policy": { "mode": "include", "max_age_days": 30 },
+"oos_excluded_product_ids": ["12345", "67890"],
+"oos_excluded_count": 2
+```
+
+`evaluate_iteration.py` applies the same rule so a report and the dashboard that produced its labels agree on what was in scope — see [Evaluation script](#evaluation-script).
 
 ---
 
@@ -370,12 +386,6 @@ If `{retailer}_historical_index.jsonl` is not in the folder, a warning notificat
 
 Per-keyword counts in the sidebar show as `12 · 4/6/2` (total · 0-count / 1-count / 2-count for the active user).
 
-### Completion progress and out-of-stock products
-
-The bar under each keyword — and the retailer-level `N / M keywords fully QA'd` bar — measures completion over **in-stock products only**. A product is out of stock when the catalog carries it with `product_liveness = false`; products absent from the catalog count as in-stock (same rule the evaluation script uses).
-
-OOS products can't be judged — there is no live info to grade them on — so they are excluded from both sides of the ratio. A keyword whose only ungraded leftovers are OOS reaches 100%, gets its ✓, and counts toward the keywords-checked total. The keyword tooltip and the QA bar spell the exclusion out (`2 labeled / 2 in stock (1 OOS excluded)`), and a keyword whose products are *all* OOS counts as checked because nothing is left to review. Grading an OOS product anyway is harmless — it simply doesn't move the bar.
-
 Topbar metrics in annotation mode:
 
 | Pill | Meaning |
@@ -465,6 +475,17 @@ python scripts/evaluate_iteration.py \
 ```
 
 `--catalog` is required. The script reads `product_liveness` from the catalog to determine stock status for each product — `true` = in-stock, `false` = out of stock. Products not present in the catalog are assumed in-stock. Catalog ingestion uses the same 90-day `updated_at` filter as the dashboard.
+
+### OOS policy
+
+`--oos_policy include|exclude` (default `include`) and `--oos_max_age_days N` (default `30`) mirror the dashboard's [out-of-stock prompt](#out-of-stock-oos-policy-both-modes), so a report scores exactly the products a reviewer could see. Match the flag to the choice made when the labels were produced.
+
+**A labelled product is never dropped.** Only unlabelled out-of-stock products leave consideration: an annotation is evidence a human did review the product, and a labelled OOS product keeps its existing OOS-aware treatment (`tp_dropped_oos`, `stock_adj_precision`, `stock_adj_recall`). An unlabelled one was never reviewable, so scoring it would penalise the model for a product nobody could judge.
+
+Excluded products are removed from every input set — previous-iteration pins, the RE mapping, and the model output — before any metric is computed, and reported rather than silently swallowed:
+
+- **Per keyword**, in the Summary tab and the breakdown CSV: `oos_excluded_count` and `oos_excluded_pids`.
+- **In `iteration_history.json`** (the run's final JSON): `oos_policy`, `oos_excluded_count`, `oos_excluded_product_ids`, `oos_excluded_reasons` (`oos_excluded` = dropped by policy, `oos_stale` = OOS and not updated within the window), and a plain-English `oos_excluded_note`.
 
 Outputs `iteration_N_report.xlsx` with two tabs:
 
