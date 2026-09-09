@@ -702,15 +702,6 @@ async function handleAnnotationFolderLoad(dirHandle, files, goldenFile, overlay,
     loadingMsg.textContent = `Loading ${activeRetailer}_historical_index.jsonl…`;
     await _loadAnnotationIndex(files, activeRetailer, keywords, notifications);
 
-    // 5b. Strip the OOS-excluded products from the keywords so they leave the
-    // review set entirely — no ghost cards, no held-back progress bars.
-    const annPruned = pruneOosExcludedFromKeywords(keywords, oosExcludedPids);
-    if (annPruned > 0) {
-      notifications.push({ type: 'info',
-        text: `${annPruned} out-of-stock product${annPruned === 1 ? '' : 's'} removed from consideration `
-            + `(ids recorded in qa_metadata.json as oos_excluded_product_ids).` });
-    }
-
     // 6. Cross-ref warnings
     const allNeeded  = new Set(keywords.flatMap(kw => kw.product_ids));
     const catalogIds = new Set(Object.keys(productIndex));
@@ -867,15 +858,12 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
 
   // 2b. IndexedDB cache — a repeat load of this file/retailer/day skips the parse.
   const dayStamp = Math.floor(Date.now() / 86400000);
-  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp, oosPolicy);
+  const cacheKey = buildIndexCacheKey(retailer, indexFile.name, indexFile.size, indexFile.lastModified, allowedPids, dayStamp);
   if (loadingMsg) loadingMsg.textContent = `Loading cached ${retailer} index…`;
   const cached = await idbGetIndex(cacheKey);
   if (cached && cached.productIndex && cached.fullIndex) {
     productIndex = cached.productIndex;
     productDumps = cached.productDumps || {};
-    // The OOS-excluded list is part of the cached build — without it a cache
-    // hit would silently lose both the pruning and the traceability record.
-    oosExcludedPids = cached.oosExcluded || [];
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, cached.fullDumps || {}, retailer);
     const n = Object.keys(productIndex).length;
     console.log(`[Annotation] Cache hit "${cacheKey}" — ${n} products, parse skipped`);
@@ -901,18 +889,17 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
       : null;
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale, oosDropped, oosExcluded, fullIndex, fullDumps } =
-      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, oosPolicy, onProgress });
+    const { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps } =
+      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
-    oosExcludedPids = oosExcluded;
 
     // Seed the Add Products cache from this same pass — no second file read.
     if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
 
     // Persist for instant repeat loads (best-effort, non-blocking).
-    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps, oosExcluded });
+    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps });
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -929,10 +916,9 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       const staleNote = skippedStale > 0
         ? ` (${skippedStale} stale records dropped by 90-day filter)`
         : '';
-      const oosNote = oosDropped > 0 ? ` ${describeOosDrop(oosDropped)}` : '';
       notifications.push({ type: 'info',
         text: `"${indexFile.name}": loaded ${loaded} of ${allowedPids.length} products `
-            + `(${fileSizeKB} KB streamed)${staleNote}.${oosNote}` });
+            + `(${fileSizeKB} KB streamed)${staleNote}.` });
     }
   } catch (e) {
     notifications.push({ type: 'error', text: `Failed to parse "${indexFile.name}": ${e.message}` });
@@ -951,13 +937,13 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
  */
 async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
-  const policy   = opts.oosPolicy || 'include';
-  const oosExcluded = [];                       // PIDs dropped by the OOS policy
+  const liveOnly = !!opts.liveOnly;             // Add Products pool only
+
   const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
   const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
-  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0, oosDropped = 0;
+  let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
 
   const safeList  = v => Array.isArray(v) ? v.map(String) : (v ? [String(v)] : []);
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
@@ -993,10 +979,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
     const isLive  = record.liveness !== false;
 
     if (inGolden) {
-      // OOS policy: dropped products never enter the index and are reported
-      // back so the caller can strip them from the keywords too.
-      const drop = oosDropReason(isLive, updatedAt, policy);
-      if (drop) { skipped++; oosDropped++; oosExcluded.push(pid); }
+      if (liveOnly && !isLive) skipped++;       // Add Products never offers dead stock
       else { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
     }
     // The full live pool feeds Add Products without a second file read.
@@ -1032,7 +1015,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
 
   if (onProgress) onProgress(fullCount);   // land on the true total
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale, oosDropped, oosExcluded, fullIndex, fullDumps };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, fullIndex, fullDumps };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -1064,7 +1047,6 @@ async function switchAnnotationRetailer(retailer) {
       if (entry.kind === 'file') files.push(await entry.getFile());
     }
     await _loadAnnotationIndex(files, retailer, keywords, []);
-    pruneOosExcludedFromKeywords(keywords, oosExcludedPids);
 
     activeKeyword = null;
     filteredPids  = null;
@@ -1084,136 +1066,6 @@ async function switchAnnotationRetailer(retailer) {
   }
 }
 
-// OUT-OF-STOCK (OOS) POLICY
-// Asked once per load, before the index is built:
-//   'include' (default) — an OOS product stays in consideration while it is
-//      still fresh, i.e. updated_at within OOS_MAX_AGE_DAYS. High-turnover
-//      retailers churn stock constantly, so something that went OOS in the last
-//      month is still worth judging; something dead longer than that is not.
-//   'exclude' — every OOS product is dropped.
-// Whatever is dropped is removed from consideration *entirely*: it never enters
-// the index, and pruneOosExcludedFromKeywords() strips it from the review set
-// and the metric inputs, so it cannot hold a keyword's progress bar below 100%.
-// The dropped PIDs are recorded in oosExcludedPids and written to
-// qa_metadata.json for traceability. Re-asked on every load (not persisted).
-const OOS_MAX_AGE_DAYS = 30;
-let oosPolicy       = 'include';
-let oosExcludedPids = [];
-
-/** Whether an out-of-stock product should be dropped from consideration, and
- *  why.  Returns null to keep the product, otherwise the reason string:
- *    'oos_excluded' — policy is 'exclude', so every OOS product goes
- *    'oos_stale'    — policy is 'include' but updated_at is older than
- *                     OOS_MAX_AGE_DAYS (or missing, which we cannot date)
- *  Live products are never dropped here; the 90-day recency filter that every
- *  JSONL parser applies is separate and still runs. */
-function oosDropReason(isLive, updatedAt, policy = oosPolicy, nowMs = Date.now()) {
-  if (isLive) return null;
-  if (policy === 'exclude') return 'oos_excluded';
-  return isRecentUpdate(updatedAt, OOS_MAX_AGE_DAYS, nowMs) ? null : 'oos_stale';
-}
-
-/** Remove the OOS-excluded PIDs from every list a keyword is evaluated on.
- *  Excluded products vanish from the grid, the progress bar, the QA-done check
- *  AND the metric inputs — "removed from consideration" means everywhere, so
- *  precision/recall are computed over the same set the reviewer actually saw.
- *  Returns the number of (keyword, pid) references removed. */
-function pruneOosExcludedFromKeywords(kwList, excluded) {
-  const drop = new Set(excluded || []);
-  if (drop.size === 0) return 0;
-
-  const FIELDS = ['product_ids', 're_product_ids', 'prev_re_ids',
-                  'new_iteration_ids', 'staging_ids', 'tp_ids', 'fp_ids'];
-  let removed = 0;
-  (kwList || []).forEach(kw => {
-    FIELDS.forEach(f => {
-      if (!Array.isArray(kw[f])) return;
-      const kept = kw[f].filter(pid => !drop.has(toStr(pid)));
-      removed += kw[f].length - kept.length;
-      kw[f] = kept;
-    });
-    const basePids = (kw.re_product_ids && kw.re_product_ids.length > 0)
-      ? kw.re_product_ids : kw.product_ids;
-    kw.total    = (basePids || []).length;
-    kw.tp_count = (kw.tp_ids || []).length;
-    kw.fp_count = (kw.fp_ids || []).length;
-  });
-  return removed;
-}
-
-/** The OOS block written into qa_metadata.json: which policy ran and exactly
- *  which product_ids it removed from consideration.  Anyone reading the saved
- *  session can tell a product that was never reviewed from one that was never
- *  offered for review, and evaluate_iteration.py can be pointed at the same
- *  list so the dashboard and the report agree on what was in scope. */
-function buildOosTrace() {
-  const pids = [...new Set(oosExcludedPids.map(toStr))].sort();
-  return {
-    oos_policy: { mode: oosPolicy, max_age_days: OOS_MAX_AGE_DAYS },
-    oos_excluded_product_ids: pids,
-    oos_excluded_count: pids.length,
-  };
-}
-
-/** One-line description of what the active OOS policy dropped, for the load
- *  notification panel. */
-function describeOosDrop(n) {
-  const products = `${n} out-of-stock product${n === 1 ? '' : 's'}`;
-  return oosPolicy === 'exclude'
-    ? `Exclude-OOS mode: ${products} dropped from consideration.`
-    : `Include-OOS mode: ${products} dropped (not updated in the last ${OOS_MAX_AGE_DAYS} days).`;
-}
-
-/** Ask the user how to treat out-of-stock products. Returns
- *  Promise<'include'|'exclude'>.  Builds a small modal reusing existing modal
- *  CSS; resolves on choice and removes itself. Falls back to the 'include'
- *  default if the DOM is unavailable or the user dismisses the dialog. */
-function confirmOosPolicy() {
-  return new Promise(resolve => {
-    if (typeof document === 'undefined' || !document.body) { resolve('include'); return; }
-
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.style.display = 'flex';
-    backdrop.style.zIndex = '10000';   // above the loading overlay
-    backdrop.innerHTML = `
-      <div class="modal modal-sm" onclick="event.stopPropagation()">
-        <h3>Include out-of-stock products?</h3>
-        <p>This historical index can include products that are no longer in stock
-           (<code>liveness = false</code>).</p>
-        <p><strong>Include</strong> (default) keeps an out-of-stock product while
-           it is still fresh — <code>updated_at</code> within the last
-           ${OOS_MAX_AGE_DAYS} days — so high-turnover stock that has only just
-           gone out is still reviewed. Anything dead longer than that is dropped.</p>
-        <p><strong>Exclude</strong> drops every out-of-stock product.</p>
-        <p>Dropped products are removed from consideration entirely — grid,
-           progress and metrics — and their ids are recorded in
-           <code>qa_metadata.json</code>.</p>
-        <div class="modal-actions" style="justify-content:flex-end;gap:8px;margin-top:16px">
-          <button class="btn" data-choice="exclude">Exclude OOS</button>
-          <button class="btn btn-primary" data-choice="include">Include OOS (last ${OOS_MAX_AGE_DAYS} days)</button>
-        </div>
-      </div>`;
-
-    let done = false;
-    const finish = val => {
-      if (done) return;
-      done = true;
-      backdrop.remove();
-      document.removeEventListener('keydown', onKey);
-      resolve(val);
-    };
-    const onKey = e => { if (e.key === 'Escape') finish('include'); };
-
-    backdrop.addEventListener('click', () => finish('include'));   // click-away = default
-    backdrop.querySelector('[data-choice="include"]').addEventListener('click', () => finish('include'));
-    backdrop.querySelector('[data-choice="exclude"]').addEventListener('click', () => finish('exclude'));
-    document.addEventListener('keydown', onKey);
-
-    document.body.appendChild(backdrop);
-  });
-}
-
 async function handleFolderLoad(dirHandle) {
   // Collect file handles first — .name is available without taking a File
   // snapshot, so we can decide whether to prompt without calling getFile() yet.
@@ -1222,22 +1074,6 @@ async function handleFolderLoad(dirHandle) {
     if (entry.kind === 'file') fileHandles.push(entry);
   }
 
-  // Ask once per load how to treat out-of-stock products, before the loading
-  // overlay goes up. Only prompt when there's actually an index to build from
-  // (a .jsonl/.jsonl.gz catalog or a pre-built product_index.json). Applies to
-  // both the annotation and catalog/review load paths below.
-  //
-  // This prompt MUST run before getFile() below: confirmOosPolicy() blocks
-  // on human input, and a File snapshot taken before that wait can go stale by
-  // the time it's read, making the read throw NotReadableError ("…permission
-  // problems that have occurred after a reference to a file was acquired").
-  const hasIndexFile = fileHandles.some(h =>
-    h.name.endsWith('.jsonl') || h.name.endsWith('.jsonl.gz') || h.name === 'product_index.json');
-  oosPolicy = hasIndexFile ? await confirmOosPolicy() : 'include';
-  oosExcludedPids = [];
-
-  // Now take the File snapshots — immediately before they're read — so the
-  // snapshot-to-read window stays small regardless of how long the prompt sat open.
   const files = [];
   for (const h of fileHandles) files.push(await h.getFile());
 
@@ -1309,24 +1145,13 @@ async function handleFolderLoad(dirHandle) {
       // missing image_url, liveness as 0/1) — we collapse to one schema.
       const cleanIndex = {};
       let normSkipped = 0;
-      let oosDropped = 0;
       for (const [rawPid, rawProduct] of Object.entries(rawIndex)) {
         const pid = toStr(rawPid);
         if (!pid) { normSkipped++; continue; }
-        const rec = normalizeProductRecord(rawProduct, pid);
-        // OOS policy. A pre-built index carries no recency filter of its own,
-        // so an undated OOS entry cannot be shown to be fresh and is dropped
-        // in include-mode too — same rule the JSONL parsers apply.
-        const drop = oosDropReason(rec.liveness !== false, pickUpdatedAt(rawProduct));
-        if (drop) { oosDropped++; oosExcludedPids.push(pid); continue; }
-        cleanIndex[pid] = rec;
+        cleanIndex[pid] = normalizeProductRecord(rawProduct, pid);
       }
       productIndex = cleanIndex;
       if (normSkipped) console.warn(`[Step 1] Skipped ${normSkipped} entries with empty product_id keys.`);
-      if (oosDropped) {
-        console.log(`[Step 1] ${describeOosDrop(oosDropped)}`);
-        notifications.push({ type: 'info', text: describeOosDrop(oosDropped) });
-      }
       console.log(`[Step 1] product_index.json loaded — ${Object.keys(productIndex).length} products`);
 
       loadingMsg.textContent = 'Loading product dumps…';
@@ -1337,8 +1162,7 @@ async function handleFolderLoad(dirHandle) {
         const cleanDumps = {};
         for (const [rawPid, dump] of Object.entries(rawDumps)) {
           const pid = toStr(rawPid);
-          // Keep dumps in sync with the OOS-filtered index.
-          if (pid && productIndex[pid]) cleanDumps[pid] = dump;
+          if (pid) cleanDumps[pid] = dump;
         }
         productDumps = cleanDumps;
       } else {
@@ -1395,7 +1219,6 @@ async function handleFolderLoad(dirHandle) {
       let parsed = 0;
       let skipped = 0;
       let skippedStale = 0;
-      let oosDropped = 0;
       let seenValid = 0;     // valid, recent product records seen (before the PID filter)
       let lineNo = 0;
       const parseErrors = [];
@@ -1445,8 +1268,6 @@ async function handleFolderLoad(dirHandle) {
         // collapses to the same predictable schema.
         // product_liveness defaults to true for products not in catalog (mirrors evaluate_iteration.py).
         const rec = normalizeProductRecord(doc, pid);
-        const oosDrop = oosDropReason(rec.liveness !== false, pickUpdatedAt(doc));
-        if (oosDrop) { oosDropped++; oosExcludedPids.push(pid); return; }
         newIndex[pid] = rec;
         newDumps[pid] = dumpForPid || doc;
         parsed++;
@@ -1504,15 +1325,11 @@ async function handleFolderLoad(dirHandle) {
       }
       console.log(`[Step 1] Parsed "${jsonlFile.name}": ${parsed} products, ${skipped} lines skipped, ${skippedStale} filtered by 90-day recency`);
 
-      if (oosDropped > 0) {
-        console.log(`[Step 1] ${describeOosDrop(oosDropped)} (from "${jsonlFile.name}")`);
-      }
       productIndex = newIndex;
       productDumps = newDumps;
       const staleNote = skippedStale > 0 ? ` (${skippedStale} stale records dropped by 90-day filter)` : '';
-      const oosNote = oosDropped > 0 ? ` ${describeOosDrop(oosDropped)}` : '';
       notifications.push({ type: 'info',
-        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.${oosNote}` });
+        text: `Catalog loaded from "${jsonlFile.name}": ${parsed} products${skipped ? ` (${skipped} lines skipped — see console)` : ''}${staleNote}.` });
     }
     };   // end loadCatalog — invoked after dataset.csv + new_iteration.xlsx below
 
@@ -1661,16 +1478,6 @@ async function handleFolderLoad(dirHandle) {
         .forEach(arr => (arr || []).forEach(p => neededPids.add(toStr(p))));
     });
     await loadCatalog();
-
-    // 3b. Strip the OOS-excluded products from every keyword list — review set
-    // AND metric inputs — so precision/recall are computed over exactly the set
-    // the reviewer saw.  evaluate_iteration.py applies the same rule.
-    const prunedRefs = pruneOosExcludedFromKeywords(keywords, oosExcludedPids);
-    if (prunedRefs > 0) {
-      notifications.push({ type: 'info',
-        text: `${prunedRefs} out-of-stock product reference${prunedRefs === 1 ? '' : 's'} removed from consideration `
-            + `(ids recorded in qa_metadata.json as oos_excluded_product_ids).` });
-    }
 
     // 4. Cross-reference warnings
     const allNeeded = new Set();
@@ -3074,7 +2881,6 @@ async function saveMetaData({ skipEmptyCheck = false, silent = false } = {}) {
       activeRetailer,
       gradedLabels,
       qa_done_keywords: [...qaDoneKeywords],
-      ...buildOosTrace(),
       exported_at: new Date().toISOString(),
     };
     await writeToClientFolder('qa_metadata.json', metadata, '/save_qa_metadata');
@@ -3109,7 +2915,6 @@ async function saveMetaData({ skipEmptyCheck = false, silent = false } = {}) {
     iteration_labels:  iterationLabels,
     label_changes:     labelChanges,
     current_iteration: currentIteration,
-    ...buildOosTrace(),
     exported_at:       new Date().toISOString(),
   };
   await writeToClientFolder('qa_metadata.json', metadata, '/save_qa_metadata');

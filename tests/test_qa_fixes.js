@@ -1,5 +1,5 @@
 /**
- * Tests for the four QA-report fixes in the Add Products / review flow.
+ * Tests for the Add Products / review-flow fixes from the QA report.
  *
  * Run with:  node tests/test_qa_fixes.js
  *
@@ -16,11 +16,6 @@
  *   3. Filter persistence— refreshAfterMarking keeps activeFilters (only the
  *                          selection is dropped), and no marking flow calls
  *                          clearFilter any more
- *   4. OOS at load time  — oosDropReason / pruneOosExcludedFromKeywords /
- *                          buildOosTrace: the include-vs-exclude choice made
- *                          when the index loads, the 30-day freshness window,
- *                          and the pruning that keeps excluded products out of
- *                          the review set, the metrics and the progress bar
  */
 
 "use strict";
@@ -77,10 +72,6 @@ const sandbox = {
   selectedPids: new Set(),
   currentUser: 'sonus',
   appMode: 'annotation',
-  HISTORICAL_INDEX_MAX_AGE_DAYS: 90,
-  OOS_MAX_AGE_DAYS: 30,
-  oosPolicy: 'include',
-  oosExcludedPids: [],
   addSourceDumps: {},          // stands in for fullLiveDumps (annotation mode)
   // render side effects are irrelevant here — count the calls instead
   renderCalls: { pills: 0, badge: 0, count: 0, grid: 0 },
@@ -97,10 +88,6 @@ const bundle = [
   extractFn(appSrc,  'function toStr(',              'app.js'),
   extractFn(appSrc,  'function strictContains(',     'app.js'),
   extractFn(appSrc,  'function getBasePids(',        'app.js'),
-  extractFn(appSrc,  'function oosDropReason(',     'app.js'),
-  extractFn(appSrc,  'function pruneOosExcludedFromKeywords(', 'app.js'),
-  extractFn(appSrc,  'function buildOosTrace(',      'app.js'),
-  extractFn(appSrc,  'function buildIndexCacheKey(', 'app.js'),
   extractFn(appSrc,  'function resolveProductDump(', 'app.js'),
   extractFn(appSrc,  'function ensureDumpCache(',    'app.js'),
   extractFn(appSrc,  'function _pidMatchesFilter(',  'app.js'),
@@ -110,13 +97,10 @@ const bundle = [
   extractFn(dataSrc, 'function annGetGrade(',        'annotation/data.js'),
   extractFn(dataSrc, 'function annSetGrade(',        'annotation/data.js'),
   extractFn(dataSrc, 'function annCountGrades(',     'annotation/data.js'),
-  extractFn(dataSrc, 'function parseUpdatedAt(',     'annotation/data.js'),
-  extractFn(dataSrc, 'function isRecentUpdate(',     'annotation/data.js'),
 ].join('\n\n');
 vm.runInContext(bundle, sandbox);
 
 const {
-  oosDropReason, pruneOosExcludedFromKeywords, buildOosTrace, buildIndexCacheKey,
   resolveProductDump, recomputeFilteredPids, refreshAfterMarking,
 } = sandbox;
 
@@ -239,122 +223,6 @@ assert('confirmBulkDisapproval keeps the filter',
 assert('refreshAfterMarking never touches activeFilters',
   !/activeFilters/.test(extractFn(appSrc, 'function refreshAfterMarking(', 'app.js')));
 assert('the Clear button still calls clearFilter', /onclick="clearFilter\(\)"/.test(html));
-
-//  4. OOS handled at load time, not in the progress bar
-console.log('── issue 4: OOS policy applied when the index loads ──────');
-
-const DAY = 24 * 60 * 60 * 1000;
-const NOW = Date.parse('2026-09-09T00:00:00Z');
-const daysAgo = n => new Date(NOW - n * DAY).toISOString();
-
-// oosDropReason: live products are never dropped, whatever the policy.
-eq('live product kept under include', oosDropReason(true, daysAgo(200), 'include', NOW), null);
-eq('live product kept under exclude', oosDropReason(true, daysAgo(200), 'exclude', NOW), null);
-
-// exclude → every OOS product goes, however fresh.
-eq('exclude drops a fresh OOS product', oosDropReason(false, daysAgo(1), 'exclude', NOW), 'oos_excluded');
-eq('exclude drops a stale OOS product', oosDropReason(false, daysAgo(80), 'exclude', NOW), 'oos_excluded');
-
-// include (default) → OOS kept only while updated_at is inside the 30-day window.
-eq('include keeps OOS updated today',      oosDropReason(false, daysAgo(0),  'include', NOW), null);
-eq('include keeps OOS updated 29 days ago',oosDropReason(false, daysAgo(29), 'include', NOW), null);
-eq('include keeps OOS at the 30-day edge', oosDropReason(false, daysAgo(30), 'include', NOW), null);
-eq('include drops OOS 31 days old',        oosDropReason(false, daysAgo(31), 'include', NOW), 'oos_stale');
-eq('include drops OOS 80 days old',        oosDropReason(false, daysAgo(80), 'include', NOW), 'oos_stale');
-eq('include drops an undated OOS product', oosDropReason(false, null, 'include', NOW), 'oos_stale');
-eq('include drops an unparseable date',    oosDropReason(false, 'not a date', 'include', NOW), 'oos_stale');
-eq('policy defaults to the session policy', oosDropReason(false, daysAgo(1), undefined, NOW), null);
-
-// This is the high-turnover case the policy exists for: stock that went out
-// yesterday is still worth judging, stock dead for months is not.
-eq('high turnover: yesterday\'s OOS stays in scope',
-  oosDropReason(false, daysAgo(1), 'include', NOW), null);
-
-// pruneOosExcludedFromKeywords: excluded PIDs leave every list, review set and
-// metric inputs alike, so nothing downstream can still count them.
-const mkKw = () => ({
-  keyword: 'jeans',
-  product_ids:       ['live1', 'dead1', 'live2'],
-  re_product_ids:    ['live1', 'dead1'],
-  prev_re_ids:       ['dead1'],
-  new_iteration_ids: ['live2', 'dead1'],
-  staging_ids:       ['dead1'],
-  tp_ids:            ['live1', 'dead1'],
-  fp_ids:            ['dead1'],
-  total: 3, tp_count: 2, fp_count: 1,
-});
-
-let kw = mkKw();
-const removed = pruneOosExcludedFromKeywords([kw], ['dead1']);
-eq('review set loses the excluded pid',   kw.product_ids, ['live1', 'live2']);
-eq('re_product_ids loses it',             kw.re_product_ids, ['live1']);
-eq('prev_re_ids loses it',                kw.prev_re_ids, []);
-eq('metric input new_iteration_ids loses it', kw.new_iteration_ids, ['live2']);
-eq('staging_ids loses it',                kw.staging_ids, []);
-eq('tp_ids loses it',                     kw.tp_ids, ['live1']);
-eq('fp_ids loses it',                     kw.fp_ids, []);
-eq('every reference is counted',          removed, 7);
-eq('total is recomputed from the review set', kw.total, 1);   // re_product_ids wins
-eq('tp_count is recomputed',              kw.tp_count, 1);
-eq('fp_count is recomputed',              kw.fp_count, 0);
-
-kw = mkKw();
-eq('nothing to exclude → no work', pruneOosExcludedFromKeywords([kw], []), 0);
-eq('nothing to exclude → lists untouched', kw.product_ids, ['live1', 'dead1', 'live2']);
-eq('a missing keyword list is tolerated', pruneOosExcludedFromKeywords(null, ['dead1']), 0);
-
-// A keyword whose every product is excluded ends up empty rather than stuck:
-// renderKeywordList hides the bar at total 0, so it can no longer sit at 99%.
-const allDead = { keyword: 'clogs', product_ids: ['dead1', 'dead2'], re_product_ids: [] };
-pruneOosExcludedFromKeywords([allDead], ['dead1', 'dead2']);
-eq('all-excluded keyword has an empty review set', allDead.product_ids, []);
-eq('all-excluded keyword reports total 0', allDead.total, 0);
-
-// buildOosTrace: what lands in qa_metadata.json.
-sandbox.oosPolicy = 'include';
-sandbox.oosExcludedPids = ['b2', 'a1', 'b2', 'c3'];
-let trace = buildOosTrace();
-eq('trace records the active policy', trace.oos_policy, { mode: 'include', max_age_days: 30 });
-eq('excluded ids are deduped and sorted', trace.oos_excluded_product_ids, ['a1', 'b2', 'c3']);
-eq('count matches the id list', trace.oos_excluded_count, 3);
-
-sandbox.oosPolicy = 'exclude';
-sandbox.oosExcludedPids = [];
-trace = buildOosTrace();
-eq('exclude mode is recorded', trace.oos_policy.mode, 'exclude');
-eq('an empty exclusion set is still reported', trace.oos_excluded_product_ids, []);
-eq('empty count is 0', trace.oos_excluded_count, 0);
-sandbox.oosPolicy = 'include';
-
-// The two policies must not share an index cache entry.
-const ck = mode => buildIndexCacheKey('gap', 'gap.jsonl', 100, 200, ['p1'], 19888, mode);
-assert('include and exclude get different cache keys', ck('include') !== ck('exclude'));
-assert('the same policy is stable',                    ck('include') === ck('include'));
-
-// Source guards: the progress bar is back to plain totals, and the load paths
-// carry the policy.
-assert('progress helpers are gone from app.js',   !/function progressPids\(/.test(appSrc));
-assert('renderKeywordList scores the base pids',
-  /const total = basePids\.length;/.test(appSrc));
-assert('annIsKeywordDone is back to its original form',
-  !/progressPids/.test(dataSrc));
-assert('the load prompt asks about OOS',          /Include out-of-stock products\?/.test(appSrc));
-assert('include is the default policy',           /let oosPolicy\s*=\s*'include';/.test(appSrc));
-assert('the freshness window is 30 days',         /const OOS_MAX_AGE_DAYS = 30;/.test(appSrc));
-assert('the parser applies the policy',
-  /const drop = oosDropReason\(isLive, updatedAt, policy\);/.test(appSrc));
-assert('the pre-built index path applies the policy',
-  /oosDropReason\(rec\.liveness !== false, pickUpdatedAt\(rawProduct\)\)/.test(appSrc));
-assert('the catalog JSONL path applies the policy',
-  /oosDropReason\(rec\.liveness !== false, pickUpdatedAt\(doc\)\)/.test(appSrc));
-assert('both load modes prune the keywords',
-  (appSrc.match(/pruneOosExcludedFromKeywords\(keywords, oosExcludedPids\)/g) || []).length >= 3);
-assert('qa_metadata.json carries the trace',
-  (appSrc.match(/\.\.\.buildOosTrace\(\),/g) || []).length === 2);
-assert('a cache hit restores the excluded list',
-  /oosExcludedPids = cached\.oosExcluded \|\| \[\];/.test(appSrc));
-assert('Add Products stays live-only regardless of policy',
-  /oosPolicy: 'exclude'/.test(addSrc));
 
 console.log('\n' + '═'.repeat(60));
 console.log(`  Tests passed: ${passed}`);

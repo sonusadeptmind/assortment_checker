@@ -141,9 +141,8 @@ async function ensureFullLiveIndex() {
   let stream = indexFile.stream();
   if (isGzip) stream = stream.pipeThrough(new DecompressionStream('gzip'));
 
-  // The Add Products pool is live-only by definition — it never offers an
-  // out-of-stock product, whatever the session's OOS policy is.
-  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, { oosPolicy: 'exclude' });
+  // The Add Products pool is live-only by definition — it never offers dead stock.
+  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, { liveOnly: true });
   fullLiveIndex = newIndex;
   fullLiveDumps = newDumps;
   _fullLiveIndexRetailer = activeRetailer;

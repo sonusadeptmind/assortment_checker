@@ -3,10 +3,8 @@
  *
  * Run with:  node tests/test_live_only_filter.js
  *
- * Covers the liveness derivation itself and the plain "drop dead records"
- * filter built on top of it.  The load-time policy that decides *when* that
- * filter runs (include-with-30-day-window vs. exclude) lives in
- * tests/test_oos_policy_load.js.
+ * Replicates the liveness derivation and the "drop dead records" filter that
+ * the Add Products pool builds on (_parseAnnotationJsonlStream liveOnly).
  *
  * Invariants verified:
  *   - liveOnly=false  → historical index unchanged; every record kept, dead
