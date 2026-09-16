@@ -629,6 +629,29 @@ async function writeToClientFolder(filename, content, fallbackServerEndpoint = n
   URL.revokeObjectURL(url);
 }
 
+/* Write raw text (not JSON) into outputs/.  writeToClientFolder stringifies its
+   content, so CSV output needs its own path.  Falls back to a browser download
+   when no folder handle is available. */
+async function writeTextToClientFolder(filename, text, mime = 'text/csv;charset=utf-8;') {
+  if (clientFolderHandle) {
+    try {
+      const outputsDir = await getOutputsHandle();
+      const fh = await outputsDir.getFileHandle(filename, { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(text);
+      await writable.close();
+      return;
+    } catch (e) {
+      console.warn(`writeTextToClientFolder: could not write ${filename}:`, e);
+    }
+  }
+  const blob = new Blob([text], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
 /* Read a file from outputs/ subfolder. Falls back to root for backwards
    compatibility with sessions saved before the outputs/ folder existed. */
 async function readFromClientFolder(filename) {
@@ -2665,139 +2688,46 @@ function buildLabelsStore() {
    evaluate_iteration.py.  Called only for QA-done keywords. */
 function computeKeywordMetrics(kw) {
   const kwName = kw.keyword;
-  const safeRound = v => (v === null || v === undefined) ? null : parseFloat(v.toFixed(4));
 
   // Collect known TPs, FPs and FNs from the live label store (iterationLabels).
   // FN = relevant products the model did NOT return (e.g. added via the Add
   // Products dialog). They never appear in new_product_ids, so they count only
   // against recall (as missed relevant items), never against precision.
-  const knownTps = new Set();
-  const knownFps = new Set();
-  const knownFns = new Set();
+  const knownTps = [];
+  const knownFps = [];
+  const knownFns = [];
   const prefix = kwName + '::';
   Object.entries(iterationLabels).forEach(([key, meta]) => {
     if (!key.startsWith(prefix)) return;
     const pid = key.slice(prefix.length);
-    if (meta.label === 'TP') knownTps.add(pid);
-    else if (meta.label === 'FP') knownFps.add(pid);
-    else if (meta.label === 'FN') knownFns.add(pid);
+    if (meta.label === 'TP') knownTps.push(pid);
+    else if (meta.label === 'FP') knownFps.push(pid);
+    else if (meta.label === 'FN') knownFns.push(pid);
   });
 
   // new_product_ids = new_iteration_ids (from new_iteration.xlsx ONLY).
   // If a keyword has no xlsx data, newProductIds is empty → precision/recall = 0.
-  const newProductIds = new Set(kw.new_iteration_ids || []);
+  const newProductIds = kw.new_iteration_ids || [];
+
+  // prev_re_ids narrowed to confirmed TPs — the tp_retention_rate denominator.
+  const tpSet     = new Set(knownTps);
+  const prevReTps = (kw.prev_re_ids || []).filter(p => tpSet.has(p));
 
   // OOS: use catalog.product_liveness (mirrors evaluate_iteration.py exactly).
   // A product is OOS when productIndex[pid].liveness === false.
   // Products absent from the catalog default to in-stock (liveness = true).
-  // We check every PID relevant to this keyword: new results + all known labels.
-  const allRelevantPids = new Set([
-    ...newProductIds, ...knownTps, ...knownFps, ...knownFns,
-  ]);
-  const oosPids = new Set([...allRelevantPids].filter(p => {
-    const entry = productIndex[p];
-    return entry !== undefined && entry.liveness === false;
-  }));
-
-  // Label partitions on new results
-  const tpInNew = new Set([...newProductIds].filter(p => knownTps.has(p)));
-  const fpInNew = new Set([...newProductIds].filter(p => knownFps.has(p)));
-
-  const labeledCount    = tpInNew.size + fpInNew.size;
-  const hasNewIteration = newProductIds.size > 0;
-
-  // OOS-aware TP partitions — computed before precision/recall so that the
-  // emptyButHasAvailableTps gate below can use availableTps.
-  const availableTps     = new Set([...knownTps].filter(p => !oosPids.has(p)));
-  const tpInNewAvailable = new Set([...tpInNew].filter(p => availableTps.has(p)));
-  // In-stock FNs — relevant items the model missed, still available to retrieve.
-  const availableFns     = new Set([...knownFns].filter(p => !oosPids.has(p)));
-
-  // Bug 3 gate: empty results + in-stock relevant items → real failure, score as 0.
-  // When the model returned nothing but known in-stock relevant items existed
-  // (TPs or FNs), that is a genuine precision/recall failure and should count as
-  // 0 in aggregates.  When there are none (all OOS or nothing relevant labeled),
-  // null is correct — there is no meaningful signal to average.
-  const emptyButHasAvailableTps =
-    !hasNewIteration && (availableTps.size + availableFns.size) > 0;
-
-  // labeled_precision: TP / (TP+FP) over labeled new results.
-  const labeledPrecision = labeledCount > 0
-    ? tpInNew.size / labeledCount
-    : (emptyButHasAvailableTps ? 0 : null);
-
-  // standard_recall: relevant retrieved / all relevant items.
-  // All relevant = known TPs (retrieved & relevant) + known FNs (relevant but
-  // missed by the model). FNs are never in new_product_ids, so they enlarge the
-  // denominator only — correctly lowering recall for keywords whose relevant
-  // products were added by hand rather than returned by the model.
-  // Naturally 0 when relevant items exist but newProductIds is empty.
-  const relevantCount = knownTps.size + knownFns.size;
-  const standardRecall = relevantCount > 0
-    ? tpInNew.size / relevantCount
-    : null;
-
-  // stock_adj_recall: excludes OOS items from the denominator so recall ∈ [0,1].
-  // Denominator = in-stock relevant items (available TPs + available FNs).
-  // Naturally 0 when in-stock relevant items exist but newProductIds is empty.
-  const availableRelevant = availableTps.size + availableFns.size;
-  const stockAdjRecall = availableRelevant > 0
-    ? tpInNewAvailable.size / availableRelevant
-    : null;
-
-  // stock_adj_precision: restrict labeled set to in-stock products only.
-  const fpInNewAvailable     = new Set([...fpInNew].filter(p => !oosPids.has(p)));
-  const stockAdjLabeledCount = tpInNewAvailable.size + fpInNewAvailable.size;
-  const stockAdjPrecision    = stockAdjLabeledCount > 0
-    ? tpInNewAvailable.size / stockAdjLabeledCount
-    : (emptyButHasAvailableTps ? 0 : null);
-
-  // labeled_f1: harmonic mean of labeled_precision and standard_recall
-  let labeledF1 = null;
-  if (labeledPrecision !== null && standardRecall !== null) {
-    const denom = labeledPrecision + standardRecall;
-    labeledF1 = denom > 0 ? 2 * labeledPrecision * standardRecall / denom : 0;
-  }
-
-  // stock_adj_f1: harmonic mean of stock_adj_precision and stock_adj_recall
-  let stockAdjF1 = null;
-  if (stockAdjPrecision !== null && stockAdjRecall !== null) {
-    const denom = stockAdjPrecision + stockAdjRecall;
-    stockAdjF1 = denom > 0 ? 2 * stockAdjPrecision * stockAdjRecall / denom : 0;
-  }
-
-  // label_coverage: fraction of new results that carry any QA label.
-  // Undefined (null) when there are no new results.
-  const labelCoverage = newProductIds.size > 0 ? labeledCount / newProductIds.size : null;
-
-  // tp_retention_rate: fraction of prev-iteration's confirmed TPs (known TPs in
-  // prev RE pinset) that appear in new results.  Measures short-term regression
-  // ("did we keep what was already pinned?") rather than all-time recall.
-  // Distinct from standard_recall which uses all ever-known TPs as denominator.
-  // Returns null when the prev RE contained no confirmed TPs.
-  const prevReTps       = new Set([...(kw.prev_re_ids || [])].filter(p => knownTps.has(p)));
-  const tpRetained      = new Set([...prevReTps].filter(p => newProductIds.has(p)));
-  const tpRetentionRate = prevReTps.size > 0 ? tpRetained.size / prevReTps.size : null;
-
-  // fp_elimination_rate: baseline FPs that no longer appear in new results.
-  // Kept null when there are no new results (trivially all FPs look "eliminated").
-  const baselineFps       = new Set(kw.fp_ids || []);
-  const fpEliminated      = new Set([...baselineFps].filter(p => !newProductIds.has(p)));
-  const fpEliminationRate = baselineFps.size > 0
-    ? (hasNewIteration ? fpEliminated.size / baselineFps.size : null)
-    : null;
-
-  return {
-    labeled_precision:   safeRound(labeledPrecision),
-    standard_recall:     safeRound(standardRecall),
-    labeled_f1:          safeRound(labeledF1),
-    stock_adj_precision: safeRound(stockAdjPrecision),
-    stock_adj_recall:    safeRound(stockAdjRecall),
-    stock_adj_f1:        safeRound(stockAdjF1),
-    label_coverage:      safeRound(labelCoverage),
-    tp_retention_rate:   safeRound(tpRetentionRate),
-    fp_elimination_rate: safeRound(fpEliminationRate),
-  };
+  return computeMetricsFromLabelSets({
+    modelPids:   newProductIds,
+    tps:         knownTps,
+    fps:         knownFps,
+    fns:         knownFns,
+    prevReTps,
+    baselineFps: kw.fp_ids || [],
+    isOos: pid => {
+      const entry = productIndex[pid];
+      return entry !== undefined && entry.liveness === false;
+    },
+  });
 }
 
 /* Build per-keyword metrics array for all QA-done keywords.
@@ -2850,21 +2780,8 @@ function computeAggregateMetrics() {
 
   const results = doneKeywords.map(kw => computeKeywordMetrics(kw));
 
-  const avg = key => {
-    const vals = results.map(r => r[key]).filter(v => v !== null);
-    return vals.length > 0 ? parseFloat((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(4)) : null;
-  };
-
   return {
-    labeled_precision:   avg('labeled_precision'),
-    standard_recall:     avg('standard_recall'),
-    labeled_f1:          avg('labeled_f1'),
-    stock_adj_precision: avg('stock_adj_precision'),
-    stock_adj_recall:    avg('stock_adj_recall'),
-    stock_adj_f1:        avg('stock_adj_f1'),
-    label_coverage:      avg('label_coverage'),
-    tp_retention_rate:   avg('tp_retention_rate'),
-    fp_elimination_rate: avg('fp_elimination_rate'),
+    ...averageMetrics(results),
     // keywords_in_dataset: number of done keywords whose metrics were actually computed
     keywords_in_dataset: doneKeywords.length,
   };
@@ -2912,7 +2829,7 @@ function buildIterationEntry() {
 /* Read existing iteration_history.json from outputs/, append/update the entry
    for the current iteration, and write it back.
    Metrics are now computed in-browser so we always overwrite with fresh values. */
-async function updateIterationHistory() {
+async function updateIterationHistory(prebuiltEntry = null) {
   let history = [];
 
   const existing = await readFromClientFolder('iteration_history.json');
@@ -2921,8 +2838,8 @@ async function updateIterationHistory() {
   }
   if (!Array.isArray(history)) history = [];
 
-  const entry = buildIterationEntry();
-  const idx = history.findIndex(e => e.iteration === currentIteration);
+  const entry = prebuiltEntry || buildIterationEntry();
+  const idx = history.findIndex(e => e.iteration === entry.iteration);
   if (idx >= 0) {
     history[idx] = { ...history[idx], ...entry };
   } else {
@@ -2985,9 +2902,13 @@ async function saveMetaData({ skipEmptyCheck = false, silent = false } = {}) {
     const kwMetrics = annBuildKeywordMetricsStore(currentUser);
     if (kwMetrics.length > 0) {
       await writeToClientFolder('keyword_metrics.json', kwMetrics, '/save_keyword_metrics');
+      await updateIterationHistory(annBuildIterationEntry(currentUser));
+      await writeTextToClientFolder('keyword_breakdown.csv', annBuildKeywordBreakdownCSV(currentUser));
     }
 
-    if (!silent) showToast('✅ Saved: qa_metadata • labels_store • keyword_metrics', 'success');
+    if (!silent) {
+      showToast('✅ Saved: qa_metadata • labels_store • keyword_metrics • iteration_history • keyword_breakdown', 'success');
+    }
     return;
   }
 

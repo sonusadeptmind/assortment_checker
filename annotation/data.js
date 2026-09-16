@@ -100,17 +100,74 @@ function annGetGrade(user, keyword, pid) {
 }
 
 /** Record or update a grade for the active user.
- *  opts: { reason, reasonOtherText, attribute, attributeOtherText } */
+ *  opts: { reason, reasonOtherText, attribute, attributeOtherText }
+ *
+ *  Hand-added products (ANN_ADDED_REASON, stamped by the Add Products dialog)
+ *  get two special cases, because "the model never returned this" stays true no
+ *  matter how the reviewer later grades it:
+ *
+ *    regraded 1 ⇄ 2 → the marker is kept, so it still scores as an FN.
+ *    regraded 0     → the add was a mistake; the product is removed outright
+ *                     (see annRemoveAddedProduct) rather than recorded as a
+ *                     model FP, and never reaches any calculation or the export.
+ */
 function annSetGrade(user, keyword, pid, grade, opts = {}) {
   if (!gradedLabels[user]) gradedLabels[user] = {};
-  gradedLabels[user][`${keyword}::${pid}`] = {
+  const key      = `${keyword}::${pid}`;
+  const prev     = gradedLabels[user][key];
+  const wasAdded = prev !== undefined && prev.reason === ANN_ADDED_REASON;
+
+  if (wasAdded && grade === 0) {
+    annRemoveAddedProduct(user, keyword, pid);
+    return;
+  }
+
+  gradedLabels[user][key] = {
     grade,
-    reason:               opts.reason               || null,
+    reason:               wasAdded ? ANN_ADDED_REASON : (opts.reason || null),
     reason_other_text:    opts.reasonOtherText       || null,
     attribute:            opts.attribute             || null,
     attribute_other_text: opts.attributeOtherText    || null,
     timestamp:            new Date().toISOString(),
   };
+  if (typeof scheduleAutoSave === 'function') scheduleAutoSave();
+}
+
+/** Undo a hand-added product: drop the grade, and — unless another reviewer has
+ *  also graded it — drop the product from the keyword's review set and the
+ *  golden rows, so it disappears from the grid, the metrics and the export CSV.
+ *  A product that came from the input CSV is never removed here; only the Add
+ *  Products dialog creates rows this can apply to. */
+function annRemoveAddedProduct(user, keyword, pid) {
+  const key = `${keyword}::${pid}`;
+  if (gradedLabels[user]) delete gradedLabels[user][key];
+
+  // Another reviewer's label would be lost with the row — keep it for them.
+  const gradedByOthers = Object.entries(gradedLabels)
+    .some(([u, store]) => u !== user && store[key] !== undefined);
+
+  if (!gradedByOthers) {
+    const kw = (typeof keywords !== 'undefined' ? keywords : [])
+      .find(k => k.keyword === keyword);
+    if (kw) {
+      ['product_ids', 're_product_ids'].forEach(field => {
+        const i = (kw[field] || []).indexOf(pid);
+        if (i !== -1) kw[field].splice(i, 1);
+      });
+      kw.total = (kw.product_ids || []).length;
+    }
+
+    const isRow = r => (r.keyword || '').trim() === keyword
+                    && (r.product_id || '').trim() === pid;
+    goldenRows = goldenRows.filter(r => !isRow(r));
+    Object.keys(goldenRowsByRetailer).forEach(slug => {
+      goldenRowsByRetailer[slug] = goldenRowsByRetailer[slug].filter(r => !isRow(r));
+    });
+
+    // A stale selection would keep counting a product that no longer exists.
+    if (typeof selectedPids !== 'undefined') selectedPids.delete(pid);
+  }
+
   if (typeof scheduleAutoSave === 'function') scheduleAutoSave();
 }
 
