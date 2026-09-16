@@ -273,6 +273,7 @@ function annBuildLabelsStore() {
         product_id:          key.substring(sep + 2),
         user,
         graded_relevance:    entry.grade,
+        label:               annGradeToLabel(entry),
         reason:              entry.reason,
         reason_other_text:   entry.reason_other_text,
         attribute:           entry.attribute,
@@ -284,22 +285,195 @@ function annBuildLabelsStore() {
   return store;
 }
 
-/** Build per-keyword metrics for annotation mode (labeled % per user). */
+
+// METRICS
+
+/* Golden-dataset grades carry the same information as iteration-mode
+   approvals, just in a different shape, so they are mapped onto the shared
+   TP/FP/FN vocabulary before any metric is computed:
+
+     grade 0            → FP  (model returned it, reviewer says irrelevant)
+     grade 1 or 2       → TP  (model returned it, reviewer says relevant)
+     grade 1/2 + added  → FN  (relevant, but the model never returned it —
+                               the reviewer pulled it in via Add Products)
+
+   "Added" is recognised by reason === 'manually_added', which annSetGrade
+   stamps on every Add Products grade, preserves across a regrade between 1 and
+   2, and which survives CSV export/reload via the {user}_reason column.
+
+   A live session can no longer produce grade 0 on an added product —
+   annSetGrade removes the product outright instead — but a CSV exported before
+   that rule existed can still carry the combination, so it is mapped to null
+   here and skipped in annDeriveLabelSets: it was never in the model output, so
+   it is not a model mistake and must not count as an FP. */
+
+const ANN_ADDED_REASON = 'manually_added';
+
+/** Map one gradedLabels entry to TP / FP / FN, or null when it should not
+ *  count at all (ungraded, or an added product the reviewer then rejected). */
+function annGradeToLabel(entry) {
+  if (!entry || entry.grade === null || entry.grade === undefined) return null;
+  const added = entry.reason === ANN_ADDED_REASON;
+  if (entry.grade === 0) return added ? null : 'FP';
+  return added ? 'FN' : 'TP';
+}
+
+/** Reduce one keyword's grades to the label sets computeMetricsFromLabelSets
+ *  expects.  modelPids excludes hand-added products — they are exactly the
+ *  products the model did NOT return. */
+function annDeriveLabelSets(user, kw) {
+  const pids = visiblePids(kw.re_product_ids && kw.re_product_ids.length
+    ? kw.re_product_ids : kw.product_ids);
+  const store = (typeof gradedLabels !== 'undefined' ? gradedLabels[user] : null) || {};
+
+  const modelPids = [], tps = [], fps = [], fns = [];
+  pids.forEach(pid => {
+    const entry = store[`${kw.keyword}::${pid}`];
+    const label = annGradeToLabel(entry);
+    if (label === 'FN') { fns.push(pid); return; }        // never in model output
+    if (entry && entry.reason === ANN_ADDED_REASON) return; // legacy added-then-rejected
+    modelPids.push(pid);
+    if (label === 'TP') tps.push(pid);
+    else if (label === 'FP') fps.push(pid);
+  });
+
+  return { modelPids, tps, fps, fns, pids };
+}
+
+/** True when this keyword is complete enough to score: flagged done in the UI,
+ *  or every visible product graded by this user. */
+function annKeywordIsScorable(kw, user) {
+  if (typeof qaDoneKeywords !== 'undefined' && qaDoneKeywords.has(kw.keyword)) return true;
+  return typeof annIsKeywordDone === 'function' ? annIsKeywordDone(kw, user) : false;
+}
+
+/** Out-of-stock predicate over the loaded product index — same rule as
+ *  iteration mode: absent from the index means in stock. */
+function annIsOos(pid) {
+  if (typeof productIndex === 'undefined') return false;
+  const entry = productIndex[pid];
+  return entry !== undefined && entry.liveness === false;
+}
+
+/* Null metrics for a keyword that is not scorable yet, so every row carries
+   the same key set regardless of QA progress. */
+const ANN_NULL_METRICS = {
+  labeled_precision: null, standard_recall: null, labeled_f1: null,
+  stock_adj_precision: null, stock_adj_recall: null, stock_adj_f1: null,
+  label_coverage: null, tp_retention_rate: null, fp_elimination_rate: null,
+};
+
+/** Build per-keyword metrics for annotation mode.
+ *
+ *  Every keyword gets a row (unchanged from before).  The original grade
+ *  counts are kept as-is; the accuracy fields from iteration mode are added
+ *  alongside them and are populated only for QA-done keywords — a
+ *  half-graded keyword would otherwise report a meaningless precision.
+ *
+ *  tp_retention_rate and fp_elimination_rate are always null here: both need a
+ *  previous iteration's pinset, which a one-shot golden dataset does not have.
+ */
 function annBuildKeywordMetricsStore(user) {
   if (!user || !keywords || !keywords.length) return [];
   return keywords.map(kw => {
     const pids   = visiblePids(kw.re_product_ids && kw.re_product_ids.length ? kw.re_product_ids : kw.product_ids);
     const counts = annCountGrades(user, kw.keyword, pids);
+    const sets   = annDeriveLabelSets(user, kw);
+    const scorable = annKeywordIsScorable(kw, user);
+
+    const metrics = scorable
+      ? computeMetricsFromLabelSets({
+          modelPids:   sets.modelPids,
+          tps:         sets.tps,
+          fps:         sets.fps,
+          fns:         sets.fns,
+          prevReTps:   [],            // no prior iteration in a golden dataset
+          baselineFps: [],
+          isOos:       annIsOos,
+        })
+      : { ...ANN_NULL_METRICS };
+
     return {
       keyword:       kw.keyword,
       retailer:      activeRetailer,
       user,
+      // Existing annotation fields — unchanged.
       total:         counts.total,
       grade_0_count: counts[0],
       grade_1_count: counts[1],
       grade_2_count: counts[2],
       labeled_count: counts.labeled,
       labeled_pct:   counts.total > 0 ? parseFloat((counts.labeled / counts.total).toFixed(4)) : null,
+      // Accuracy metrics, same fields and semantics as iteration mode.
+      ...metrics,
+      tp_count:          sets.tps.length,
+      fp_count:          sets.fps.length,
+      fn_count:          sets.fns.length,
+      total_in_new:      sets.modelPids.length,
+      has_new_iteration: sets.modelPids.length > 0,
+      manual_qa_status:  scorable,
     };
   });
+}
+
+/** Aggregate snapshot for iteration_history.json — the annotation-mode twin of
+ *  buildIterationEntry() in app.js, with the same field names so the two
+ *  histories merge and chart identically. */
+function annBuildIterationEntry(user) {
+  const rows     = annBuildKeywordMetricsStore(user);
+  const scorable = rows.filter(r => r.manual_qa_status);
+
+  let toCheck = 0, approved = 0, disapproved = 0;
+  rows.forEach(r => {
+    toCheck     += r.total - r.labeled_count;
+    approved    += r.grade_1_count + r.grade_2_count;
+    disapproved += r.grade_0_count;
+  });
+
+  return {
+    // Stable per-retailer id: a golden dataset has no iteration number, and
+    // keying on the retailer keeps two retailers' snapshots side by side.
+    iteration:           `golden_${activeRetailer || 'unknown'}`,
+    app_mode:            'annotation',
+    retailer:            activeRetailer,
+    user,
+    timestamp:           new Date().toISOString(),
+    ...averageMetrics(scorable),
+    keywords_evaluated:  scorable.length,
+    total_pids_to_check: toCheck,
+    approved_count:      approved,
+    disapproved_count:   disapproved,
+  };
+}
+
+/** Flat per-keyword CSV of the same rows written to keyword_metrics.json —
+ *  the annotation-mode equivalent of generate_keyword_breakdown_csv() in
+ *  scripts/evaluate_iteration.py. */
+const ANN_BREAKDOWN_COLS = [
+  'keyword', 'retailer', 'user', 'manual_qa_status',
+  'total', 'grade_0_count', 'grade_1_count', 'grade_2_count',
+  'labeled_count', 'labeled_pct',
+  'tp_count', 'fp_count', 'fn_count', 'total_in_new',
+  'labeled_precision', 'standard_recall', 'labeled_f1',
+  'stock_adj_precision', 'stock_adj_recall', 'stock_adj_f1',
+  'label_coverage', 'tp_retention_rate', 'fp_elimination_rate',
+];
+
+function annBuildKeywordBreakdownCSV(user) {
+  const rows  = annBuildKeywordMetricsStore(user);
+  const lines = [ANN_BREAKDOWN_COLS.map(_csvVal).join(',')];
+  rows.forEach(r => {
+    lines.push(ANN_BREAKDOWN_COLS.map(c => _csvVal(r[c] === null || r[c] === undefined ? '' : r[c])).join(','));
+  });
+  return lines.join('\n');
+}
+
+// Node-only: expose the pure builders for the test suite (no-op in the browser).
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    annGradeToLabel, annDeriveLabelSets, annKeywordIsScorable,
+    annBuildKeywordMetricsStore, annBuildIterationEntry,
+    annBuildKeywordBreakdownCSV, annBuildLabelsStore, annBuildExportCSV,
+    ANN_BREAKDOWN_COLS, ANN_ADDED_REASON,
+  };
 }
