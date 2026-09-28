@@ -46,7 +46,7 @@ function extractFn(src, signature, label) {
 }
 
 const sandbox = {
-  console, ReadableStream, TextDecoderStream, TextEncoder,
+  console, ReadableStream, TextDecoder, TextEncoder,
   HISTORICAL_INDEX_MAX_AGE_DAYS: 90,
 };
 sandbox.globalThis = sandbox;

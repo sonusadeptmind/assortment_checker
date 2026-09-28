@@ -19,7 +19,7 @@
 <!-- Auto-save module (must load before app.js so scheduleAutoSave is defined) -->
 <script src="autosave.js"></script>
 <!-- Add Products module (loaded before app.js so productMatchesContentFilter is defined) -->
-<script src="add_products.js?v=2"></script>
+<script src="add_products.js?v=5"></script>
 </head>
 <body>
 <!-- LOADING OVERLAY -->
@@ -314,7 +314,7 @@
       <input type="text" id="addSearchInput" class="search-input add-products-search" placeholder="Search live products…" oninput="onAddSearchInput()">
       <div class="add-products-filter">
         <select id="addFilterField" class="filter-select" onchange="addProductsPopulateFilterValues(); onAddFilterChange()" title="Filter by">
-          <option value="product_dump">Product Dump</option>
+          <option value="product_dump">Any Text</option>
           <option value="title">Title</option>
           <option value="description">Description</option>
           <option disabled>──────────</option>
@@ -536,6 +536,6 @@
 
 <div id="toastMessage" class="toast"></div>
 
-<script src="app.js"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>

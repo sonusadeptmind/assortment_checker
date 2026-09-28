@@ -11,18 +11,23 @@
 
 // STATE
 let fullLiveIndex      = null;   // { pid: record }  — annotation-mode lazy cache; null = not loaded
-let fullLiveDumps      = null;   // { pid: dump }
+let fullLiveDumps      = null;   // { pid: dump } — iteration mode only; the annotation
+                                 // pool holds records without dumps (see ensureFullLiveIndex)
 let _fullLiveIndexRetailer = null;
-let addDialogDumpCache   = {};   // pid → lowercased dump JSON, built lazily for the product_dump filter
 let addDialogSelected    = new Set();
 let addDialogCandidates  = [];   // current filtered candidate pids
 let addDialogPage        = 0;    // 0-indexed current page of the candidate list
 let addDialogFilters     = [];   // committed filter pills [{ field, operator, value, label }] — all AND-ed
 let addDialogGrade       = 1;    // annotation mode: grade applied to added products (1 or 2)
 let _addSearchDebounce   = null;
+let addPageDumps         = {};   // { pid: dump } for the page on screen ONLY — see loadPageDumps
+let _addDumpToken        = 0;    // bumped per page render; a slow fetch checks it before landing
+let _addDumpsPending     = false; // the current page's dumps are still being read
+let _annIndexFile        = null; // memoized index File for slicing dumps out of
+let _annIndexFileRetailer = null;
 
 const ADD_FIELD_LABELS = {
-  product_dump: 'Dump', title: 'Title', description: 'Desc',
+  product_dump: 'Any text', title: 'Title', description: 'Desc',
   brand: 'Brand', color: 'Color', product_type: 'Type',
   material: 'Material', occasion: 'Occasion',
 };
@@ -43,7 +48,11 @@ function productMatchesContentFilter(record, dumpStr, field, operator, value) {
   let matches = false;
 
   if (field === 'product_dump') {
-    matches = strictContains(dumpStr || '', value);
+    // The main grid passes real dump text for its (bounded) loaded set, so its
+    // behaviour is unchanged.  The Add Products pool holds no dumps and passes
+    // '', falling back to the record's search blob — which covers every text
+    // field the dump carried, across the whole catalog.
+    matches = strictContains(dumpStr || (record && record.searchText) || '', value);
   } else if (field === 'title') {
     matches = record ? strictContains(record.title || '', value) : false;
   } else if (field === 'description') {
@@ -59,17 +68,13 @@ function productMatchesContentFilter(record, dumpStr, field, operator, value) {
 
 /** Compute the candidate PID list for the Add Products dialog.
  *  - index: the search pool (full live index or productIndex)
- *  - getDumpStr: pid → lowercased dump JSON, called LAZILY and only for the
- *    explicit product_dump filter (most opens never stringify a single dump)
  *  - existingPids: PIDs already in the active keyword's review set (excluded)
  *  - filters: [{ field, operator, value }] (content/attribute only)
  *  - searchTerm: free-text, case-insensitive substring over rec.searchText
- *    (curated fields). Deep dump search is the explicit product_dump filter.
  *  Only live products (liveness !== false) are returned. */
-function computeAddCandidates(index, getDumpStr, existingPids, filters, searchTerm) {
+function computeAddCandidates(index, existingPids, filters, searchTerm) {
   const exclude = new Set(existingPids || []);
   const term    = (searchTerm || '').trim().toLowerCase();
-  const _dump   = typeof getDumpStr === 'function' ? getDumpStr : () => '';
   const out = [];
 
   for (const pid in index) {
@@ -80,8 +85,7 @@ function computeAddCandidates(index, getDumpStr, existingPids, filters, searchTe
     if (term && !(rec.searchText || '').includes(term)) continue;
 
     const ok = (filters || []).every(f =>
-      productMatchesContentFilter(
-        rec, f.field === 'product_dump' ? _dump(pid) : '', f.field, f.operator, f.value)
+      productMatchesContentFilter(rec, '', f.field, f.operator, f.value)
     );
     if (!ok) continue;
 
@@ -143,9 +147,12 @@ async function ensureFullLiveIndex() {
 
   // Only the 90-day recency filter runs during the parse; the dialog's own
   // liveness check (computeAddCandidates) keeps dead stock out of the results.
-  const { newIndex, newDumps } = await _parseAnnotationJsonlStream(stream, null, {});
+  // withDumps:false keeps this pool to records — the whole catalog's dumps do
+  // not fit in the tab, and nothing in the dialog's search path reads one.
+  const { newIndex } = await _parseAnnotationJsonlStream(stream, null,
+    { withDumps: false, trackOffsets: !isGzip });
   fullLiveIndex = newIndex;
-  fullLiveDumps = newDumps;
+  fullLiveDumps = {};
   _fullLiveIndexRetailer = activeRetailer;
   return true;
 }
@@ -155,6 +162,9 @@ function resetFullLiveIndex() {
   fullLiveIndex = null;
   fullLiveDumps = null;
   _fullLiveIndexRetailer = null;
+  addPageDumps  = {};
+  _annIndexFile = null;
+  _annIndexFileRetailer = null;
 }
 
 /** Seed the full-live-index cache from the initial annotation parse, so the
@@ -168,6 +178,123 @@ function setFullLiveIndex(index, dumps, retailer) {
   _fullLiveIndexRetailer = retailer;
 }
 
+// ON-DEMAND PRODUCT DUMPS
+//
+// The live pool holds records only — a dump is ~20x the size of the record it
+// belongs to, and the whole catalog's dumps do not fit in the tab.  But a
+// reviewer cannot judge a retrieved product without its raw payload.  So the
+// parse records each record's byte span in the index file (record.off/len) and
+// the dumps for the ~32 products actually on screen are sliced back out on
+// demand, kept only while that page is showing.
+
+/** The index File for the active retailer, memoized — every page fetch would
+ *  otherwise re-enumerate the client folder. */
+async function _resolveAnnotationIndexFile() {
+  if (_annIndexFile && _annIndexFileRetailer === activeRetailer) return _annIndexFile;
+  if (!clientFolderHandle || !activeRetailer) return null;
+
+  const files = [];
+  for await (const [, entry] of clientFolderHandle.entries()) {
+    if (entry.kind === 'file') files.push(await entry.getFile());
+  }
+  const file = findHistoricalIndexFile(files, activeRetailer);
+  if (!file) return null;
+
+  _annIndexFile = file;
+  _annIndexFileRetailer = activeRetailer;
+  return file;
+}
+
+/** Read the raw product_dump for each pid straight out of the index file.
+ *  Returns { pid: dump } for the pids it could read — a pid with no recorded
+ *  byte span (gzipped source, or simply not in the pool) is skipped, so the
+ *  feature reports itself unavailable rather than slicing the wrong bytes. */
+async function fetchDumpsForPids(pids) {
+  const out   = {};
+  const index = getAddSourceIndex();
+  const want  = (pids || []).filter(pid => {
+    const rec = index[pid];
+    return rec && typeof rec.off === 'number' && typeof rec.len === 'number';
+  });
+  if (!want.length) return out;
+
+  const file = await _resolveAnnotationIndexFile();
+  if (!file) return out;
+
+  // A page is only ~775 KB of dump, but 32 concurrent slices of a 9.9 GB file
+  // is needless pressure — a handful of workers drain the list just as fast.
+  let next = 0;
+  const worker = async () => {
+    while (next < want.length) {
+      const pid = want[next++];
+      const rec = index[pid];
+      try {
+        const doc = JSON.parse(await file.slice(rec.off, rec.off + rec.len).text());
+        out[pid] = (doc.product_dump && typeof doc.product_dump === 'object'
+                    && !Array.isArray(doc.product_dump)) ? doc.product_dump : doc;
+      } catch (e) {
+        console.warn(`[AddProducts] could not read dump for ${pid}:`, e);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, want.length) }, worker));
+  return out;
+}
+
+/** Fetch the dumps for one rendered page into the page-scoped cache.
+ *  Resolves true when the results landed, false when a newer page rendered
+ *  first — paging forward quickly must not leave page 3's dumps showing under
+ *  page 4's products. */
+function loadPageDumps(pids) {
+  const token = ++_addDumpToken;
+  addPageDumps = {};
+  _addDumpsPending = true;
+
+  const land = dumps => {
+    if (token !== _addDumpToken) return false;   // a newer page owns the cache now
+    addPageDumps = dumps;
+    _addDumpsPending = false;
+    // Cards paint synchronously and their dumps arrive here.  A reviewer who
+    // clicked one in between is staring at an empty payload right now, so fill
+    // it in rather than leaving them to reopen the product.
+    if (typeof refreshModalDump === 'function') refreshModalDump();
+    return true;
+  };
+  return fetchDumpsForPids(pids).then(land, () => land({}));
+}
+
+/** True while the dumps for the page on screen are still being read. */
+function addPageDumpsPending() {
+  return _addDumpsPending;
+}
+
+/** Raw dump for a product on the page the Add dialog is currently showing.
+ *  Read by app.js's resolveProductDump for the detail modal. */
+function getAddPageDump(pid) {
+  return addPageDumps[pid] || null;
+}
+
+/** Keep the raw dumps of just-added products, so their payload view still
+ *  works once they are in the main grid.  The page cache only ever holds the
+ *  page last rendered while a selection survives paging, so anything it no
+ *  longer has is read from the file again. */
+function persistAddedDumps(pids) {
+  const srcDumps = getAddSourceDumps();
+  pids.forEach(pid => {
+    if (productDumps[pid]) return;
+    const dump = srcDumps[pid] || addPageDumps[pid];
+    if (dump) productDumps[pid] = dump;
+  });
+
+  const missing = pids.filter(pid => !productDumps[pid]);
+  if (!missing.length) return Promise.resolve();
+
+  return fetchDumpsForPids(missing).then(dumps => {
+    for (const pid in dumps) if (!productDumps[pid]) productDumps[pid] = dumps[pid];
+    dumpFilterDirty = true;   // the main grid's Product Dump filter can see these now
+  }).catch(() => {});
+}
+
 // DIALOG SOURCES
 
 function getAddSourceIndex() {
@@ -175,17 +302,6 @@ function getAddSourceIndex() {
 }
 function getAddSourceDumps() {
   return appMode === 'annotation' ? (fullLiveDumps || {}) : productDumps;
-}
-
-/** Lazily stringify one product's dump for the product_dump filter, memoizing
- *  the result.  Search uses the precomputed rec.searchText, so most dialog
- *  sessions never stringify a single dump. */
-function getAddDumpStr(pid) {
-  if (pid in addDialogDumpCache) return addDialogDumpCache[pid];
-  let s = '';
-  try { s = JSON.stringify(getAddSourceDumps()[pid]).toLowerCase(); } catch (_) {}
-  addDialogDumpCache[pid] = s;
-  return s;
 }
 
 // DIALOG UI
@@ -219,7 +335,6 @@ async function openAddProductsModal() {
     return;
   }
 
-  addDialogDumpCache = {};             // fresh memo for this pool
   addProductsPopulateFilterValues();   // categorical values now that the pool is ready
   addProductsApplyFilters();
 }
@@ -299,7 +414,7 @@ function addProductsApplyFilters() {
   if (live) filters.push(live);
 
   addDialogCandidates = computeAddCandidates(
-    getAddSourceIndex(), getAddDumpStr, keywordExistingPids(activeKeyword), filters, search
+    getAddSourceIndex(), keywordExistingPids(activeKeyword), filters, search
   );
   addDialogPage = 0;             // new result set → back to the first page
   renderAddProductsGrid();
@@ -366,14 +481,16 @@ function renderAddProductsGrid() {
     count.textContent = 'No matching live products';
     grid.innerHTML = '<div class="add-products-status">No live products match — adjust the search or filter.</div>';
     renderAddProductsPager(0, 0);
+    loadPageDumps([]);
     return;
   }
 
   const start = addDialogPage * ADD_PAGE_SIZE;
   const end   = Math.min(start + ADD_PAGE_SIZE, total);
+  const pagePids = addDialogCandidates.slice(start, end);
   count.textContent = `Showing ${start + 1}–${end} of ${total}`;
 
-  grid.innerHTML = addDialogCandidates.slice(start, end).map(pid => {
+  grid.innerHTML = pagePids.map(pid => {
     const p = index[pid] || {};
     const isSel = addDialogSelected.has(pid);
     const price = p.price ? `$${Number(p.price).toFixed(2)}` : '';
@@ -395,6 +512,10 @@ function renderAddProductsGrid() {
   }).join('');
 
   renderAddProductsPager(addDialogPage, pages);
+
+  // The cards are on screen; their raw dumps follow asynchronously so the
+  // detail modal can show a payload the pool itself does not carry.
+  loadPageDumps(pagePids);
 }
 
 /** Render the Prev / page X of N / Next controls below the grid. Hidden when
@@ -485,13 +606,15 @@ function confirmAddProducts() {
 
   const kw       = activeKeyword.keyword;
   const srcIndex = getAddSourceIndex();
-  const srcDumps = getAddSourceDumps();
   const now      = new Date().toISOString();
+
+  // The raw payload for these products lives in the index file, not the pool —
+  // without this the payload view is empty for every newly added product.
+  persistAddedDumps(pids);
 
   pids.forEach(pid => {
     // Bring the product into the working index so it renders in the main grid.
     if (!productIndex[pid] && srcIndex[pid]) productIndex[pid] = srcIndex[pid];
-    if (!productDumps[pid] && srcDumps[pid]) productDumps[pid] = srcDumps[pid];
 
     // Add to the active keyword's review set.
     if (!activeKeyword.product_ids.includes(pid)) activeKeyword.product_ids.push(pid);

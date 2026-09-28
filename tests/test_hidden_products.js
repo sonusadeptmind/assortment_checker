@@ -108,6 +108,7 @@ vm.runInContext([
   function updateQaDoneUI() {}
   function annUpdateBulkRow() {}
   function scheduleAutoSave() {}
+  function persistAddedDumps() { return Promise.resolve(); }
   function buildAddedGoldenRow(h, r, kw, pid) { return { keyword: kw, product_id: pid, retailer: r }; }
 
   const product = title => ({ title, brand: 'Levi', color: 'blue', image_url: 'x', liveness: true });
