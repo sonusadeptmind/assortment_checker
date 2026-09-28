@@ -162,13 +162,37 @@ function normalizeProductRecord(raw, pid) {
     liveness:     r.product_liveness !== undefined ? toBool(r.product_liveness, true)
                   : (r.liveness !== undefined ? toBool(r.liveness, true) : true),
   };
-  // Precomputed search haystack (curated fields, ~100 chars) — lets the Add
-  // Products free-text search run .includes() instead of scanning multi-KB dump
-  // strings. Deep dump search remains available via the product_dump filter.
-  record.searchText = [
-    record.title, record.brand, record.product_type,
-    record.color, record.material, record.occasion, record.category,
-  ].map(toStr).filter(Boolean).join(' ').toLowerCase();
+  // Precomputed search haystack.  The Add Products dialog searches this rather
+  // than raw dumps: a dump is ~24 KB against ~1 KB of actual text, and holding
+  // one per product is what exhausted the tab's heap on a large catalog.
+  //
+  // Values are de-duplicated WHOLE, never tokenised.  Token-level dedup would
+  // sort "youth baseball glove" into three separate words and silently break
+  // every multi-word query, so order within a value is preserved and only
+  // exact repeats (the title echoed in product_texts, say) are dropped.
+  const seenText = new Set();
+  const parts    = [];
+  const pushText = v => {
+    if (v === null || v === undefined || typeof v === 'boolean') return;
+    if (Array.isArray(v)) { v.forEach(pushText); return; }
+    if (typeof v === 'object') { Object.values(v).forEach(pushText); return; }
+    const t = toStr(v).trim().toLowerCase();
+    if (!t || seenText.has(t)) return;
+    seenText.add(t);
+    parts.push(t);
+  };
+  [
+    record.title, record.brand, record.product_type, record.color,
+    record.material, record.occasion, record.category, record.description,
+    r.tags, r.bullets, r.collections, r.Collections, r.product_texts,
+    r.product_type_text, r.topologies_text, r.text_autocomplete,
+    r.HIERARCHY_NAME, r.PRODUCT_CATEGORIES, r.SPORTS_TYPE, r.PRIMARY_CATEGORY_DSG,
+    r.Sport, r.Activity, r.Gender,
+    dump && dump.tags, dump && dump.tag, dump && dump.topologies,
+  ].forEach(pushText);
+  // Hard cap: the largest record in a real catalog ran to 2.6 MB, and an
+  // unbounded blob would put the pool straight back over the heap.
+  record.searchText = parts.join(' ').slice(0, 4096);
   return record;
 }
 
@@ -833,7 +857,13 @@ function buildIndexCacheKey(retailer, fileName, size, lastModified, allowedPids,
   // an "include OOS" cache entry (or vice-versa).  dayStamp already rolls the
   // key daily, which also keeps the 30-day OOS window from going stale.
   const oosSig = oosMode === 'exclude' ? 'oos-exclude' : 'oos-include';
-  return [retailer, fileName, size, lastModified, dayStamp, pidSig, oosSig].join('::');
+  // Pool-shape version, last so idbPutIndex's `${retailer}::` prune still
+  // matches and clears the older entries.  Pools cached before the live pool
+  // dropped its raw dumps are many times larger, and reusing one on a cache
+  // hit would reintroduce the blow-up the pool change exists to prevent.
+  // v4 adds the byte offsets on-demand dump fetching slices with: a v3 entry
+  // has none, so reusing one would leave the feature silently dead.
+  return [retailer, fileName, size, lastModified, dayStamp, pidSig, oosSig, 'v4'].join('::');
 }
 
 async function idbGetIndex(key) {
@@ -911,7 +941,7 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
     productIndex = cached.productIndex;
     productDumps = cached.productDumps || {};
     staleFilteredPids = cached.stalePids || {};
-    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, cached.fullDumps || {}, retailer);
+    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(cached.fullIndex, null, retailer);
     const n = Object.keys(productIndex).length;
     console.log(`[Annotation] Cache hit "${cacheKey}" — ${n} products, parse skipped`);
     notifications.push({ type: 'info', text: `"${indexFile.name}": loaded ${n} products from cache (instant).` });
@@ -936,18 +966,19 @@ async function _loadAnnotationIndex(files, retailer, kwList, notifications) {
       ? (live) => { loadingMsg.textContent = `Building ${retailer} index… ${live.toLocaleString()} live products`; }
       : null;
 
-    const { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps } =
-      await _parseAnnotationJsonlStream(stream, allowedPids, { buildFullLive: true, onProgress });
+    const { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex } =
+      await _parseAnnotationJsonlStream(stream, allowedPids,
+        { buildFullLive: true, trackOffsets: !isGzip, onProgress });
 
     productIndex = newIndex;
     productDumps = newDumps;
     staleFilteredPids = stalePids;
 
     // Seed the Add Products cache from this same pass — no second file read.
-    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, fullDumps, retailer);
+    if (typeof setFullLiveIndex === 'function') setFullLiveIndex(fullIndex, null, retailer);
 
     // Persist for instant repeat loads (best-effort, non-blocking).
-    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, fullDumps, stalePids });
+    idbPutIndex(cacheKey, retailer, { productIndex: newIndex, productDumps: newDumps, fullIndex, stalePids });
 
     const loaded = Object.keys(newIndex).length;
     console.log(`[Annotation] Done: ${parsed} matched, ${skipped} skipped, `
@@ -995,9 +1026,14 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const allowed  = allowedPids ? new Set(allowedPids) : null;   // null = accept all PIDs
 
   const buildFullLive = !!opts.buildFullLive;   // also collect the whole live pool (Add Products)
+  const withDumps     = opts.withDumps !== false;   // retain raw dumps for the matched set
+  // Record each record's [byteOffset, byteLength] in the source so a dump can
+  // later be re-read with a single File.slice().  Opt-in: the positions address
+  // whatever the reader yields, so a gzip-decompressed stream must not set it.
+  const trackOffsets  = !!opts.trackOffsets;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const newIndex = {}, newDumps = {};
-  const fullIndex = {}, fullDumps = {};         // every live+recent record (when buildFullLive)
+  const fullIndex = {};                         // every live+recent record (when buildFullLive)
   let parsed = 0, skipped = 0, skippedStale = 0, fullCount = 0;
   const stalePids = {};                         // requested PIDs the 90-day filter dropped
 
@@ -1005,7 +1041,7 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
   const safeFirst = (arr, fb) => Array.isArray(arr) && arr.length ? arr[0] : fb;
   const isUrl     = s => typeof s === 'string' && /^https?:\/\//i.test(s.trim());
 
-  const processLine = line => {
+  const processLine = (line, lineOff, lineLen) => {
     const t = line.trim();
     if (!t) return;
 
@@ -1037,44 +1073,69 @@ async function _parseAnnotationJsonlStream(stream, allowedPids, opts = {}) {
 
     // Single source of truth for shape — every catalog variant funnels here.
     const record  = normalizeProductRecord(doc, pid);
+    // Two numbers per record (~10 MB on a 157k-product pool) buy random access
+    // back into the file, so Add Products can show a raw dump the pool itself
+    // is far too small to hold.
+    if (trackOffsets) { record.off = lineOff; record.len = lineLen; }
     const docDump = dump || doc;   // store product_dump for the modal JSON viewer
     const isLive  = record.liveness !== false;
 
-    if (inGolden) { newIndex[pid] = record; newDumps[pid] = docDump; parsed++; }
-    // The full live pool feeds Add Products without a second file read.
+    if (inGolden) {
+      newIndex[pid] = record;
+      if (withDumps) newDumps[pid] = docDump;
+      parsed++;
+    }
+    // The full live pool feeds Add Products without a second file read.  It
+    // holds records ONLY.  Search runs off rec.searchText and the curated
+    // fields and never reads a dump, while a dump is ~20x the size of the
+    // record it belongs to (measured: 24.2 KB against 1.3 KB on a 355k-record
+    // index) -- retaining one per product is what exhausted the tab's heap.
     if (buildFullLive && isLive) {
-      fullIndex[pid] = record; fullDumps[pid] = docDump;
+      fullIndex[pid] = record;
       if (onProgress && (++fullCount % 2000 === 0)) onProgress(fullCount);
     }
   };
 
-  // Stream chunks through a TextDecoder, accumulate partial lines in `remainder`
-  const reader = stream.pipeThrough(new TextDecoderStream('utf-8')).getReader();
-  let remainder = '';
+  // Split raw bytes on 0x0A and decode each complete line on its own, rather
+  // than decoding the stream and splitting the text.  UTF-8 is
+  // self-synchronizing — every continuation byte has its high bit set — so
+  // 0x0A is only ever a real newline and a split can never land inside a
+  // character.  Decoding text first would work too, but it throws away the
+  // byte positions `trackOffsets` exists to record: a single accented
+  // character makes a character index and a byte offset diverge for good.
+  const reader  = stream.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let carry     = null;   // bytes of the partial line left by the previous chunk
+  let absOffset = 0;      // file offset of carry[0], or of the next byte to arrive
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) {
-        if (remainder.trim()) processLine(remainder);
-        break;
+      if (done) break;
+
+      let bytes = value;
+      if (carry) {
+        bytes = new Uint8Array(carry.length + value.length);
+        bytes.set(carry, 0);
+        bytes.set(value, carry.length);
       }
-      const chunk  = remainder + value;
-      const nlIdx  = chunk.lastIndexOf('\n');
-      if (nlIdx === -1) {
-        remainder = chunk;              // no complete line yet, keep buffering
-      } else {
-        const complete = chunk.slice(0, nlIdx);
-        remainder      = chunk.slice(nlIdx + 1);
-        for (const line of complete.split('\n')) processLine(line);
+
+      let start = 0, nl;
+      while ((nl = bytes.indexOf(0x0A, start)) !== -1) {
+        processLine(decoder.decode(bytes.subarray(start, nl)), absOffset + start, nl - start);
+        start = nl + 1;
       }
+      carry      = start < bytes.length ? bytes.slice(start) : null;
+      absOffset += start;
     }
+    // A file whose last line has no trailing newline.
+    if (carry) processLine(decoder.decode(carry), absOffset, carry.length);
   } finally {
     reader.releaseLock();
   }
 
   if (onProgress) onProgress(fullCount);   // land on the true total
 
-  return { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex, fullDumps };
+  return { newIndex, newDumps, parsed, skipped, skippedStale, stalePids, fullIndex };
 }
 
 /** Called when the retailer topbar dropdown changes. */
@@ -2125,6 +2186,10 @@ function requireUser() {
 function resolveProductDump(pid) {
   return productDumps[pid]
     || (typeof getAddSourceDumps === 'function' ? getAddSourceDumps()[pid] : null)
+    // Annotation mode: the live pool holds no dumps at all, so a candidate's
+    // raw payload comes from the page-scoped cache the Add dialog fetches for
+    // the ~32 products it is currently showing.
+    || (typeof getAddPageDump === 'function' ? getAddPageDump(pid) : null)
     || {};
 }
 
@@ -2161,9 +2226,15 @@ function openModal(pid, opts = {}) {
     .map(([l, v]) => `<div class="modal-attr"><div class="modal-attr-label">${l}</div><div class="modal-attr-value">${escapeHtml(String(v))}</div></div>`)
     .join('');
 
-  // JSON dump
+  // JSON dump.  In annotation mode an Add Products candidate's payload is
+  // sliced out of the index file only once its card is on screen, so it can
+  // still be in flight here — say so rather than showing a bare "{}" that
+  // reads like a product with no data.  refreshModalDump fills it in.
   const dumpStr = JSON.stringify(dump, null, 2);
-  document.getElementById('modalJsonDump').textContent = dumpStr;
+  const dumpPending = dumpStr === '{}'
+    && typeof addPageDumpsPending === 'function' && addPageDumpsPending();
+  document.getElementById('modalJsonDump').textContent =
+    dumpPending ? 'Loading raw payload…' : dumpStr;
   document.getElementById('modalDumpSearch').value = '';
   document.getElementById('dumpSearchCount').textContent = '';
   dumpMatchIndex = -1;
@@ -2201,6 +2272,28 @@ function openModal(pid, opts = {}) {
   }
 
   document.getElementById('modalBackdrop').classList.add('active');
+}
+
+/** Repaint the modal's raw payload after a late-arriving dump.  Called when the
+ *  Add dialog's page fetch lands: a product opened in the gap between its card
+ *  rendering and its dump arriving would otherwise stay empty until reopened.
+ *  A no-op when the payload on screen is already the right one, so this is
+ *  harmless for products whose dump came from productDumps all along. */
+function refreshModalDump() {
+  if (!modalPid) return;
+  const pre = document.getElementById('modalJsonDump');
+  if (!pre) return;
+
+  const dumpStr = JSON.stringify(resolveProductDump(modalPid), null, 2);
+  if (pre.textContent === dumpStr) return;
+
+  // Re-run the reviewer's search instead of blowing their highlights away.
+  if ((document.getElementById('modalDumpSearch').value || '').trim()) {
+    searchProductDump();
+    return;
+  }
+  pre.innerHTML = '';
+  pre.textContent = dumpStr;
 }
 
 function closeModal() {
