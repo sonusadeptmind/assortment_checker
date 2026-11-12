@@ -104,6 +104,15 @@ function firstNonEmpty(...candidates) {
   return '';
 }
 
+/** Turn a product's stored url (e.g. "www.ulta.com/p/...") into a clickable
+ *  absolute href. Catalog urls ship without a scheme, so a bare href would
+ *  resolve relative to the dashboard's own origin instead of the retailer site. */
+function productUrlHref(url) {
+  const u = toStr(url).trim();
+  if (!u) return '';
+  return /^https?:\/\//i.test(u) ? u : `https://${u}`;
+}
+
 /** Coerce a value to a boolean, tolerating common string encodings. */
 function toBool(v, fallback = false) {
   if (v === null || v === undefined) return fallback;
@@ -146,6 +155,7 @@ function normalizeProductRecord(raw, pid) {
   const record = {
     product_id:   toStr(pid || r.product_id || (dump && dump.product_id) || r.id || r._id),
     title:        firstNonEmpty(r.title, dump && dump.title),
+    url:          firstNonEmpty(r.url, dump && dump.url),
     image_url:    firstNonEmpty(images[0], r.image_url),
     brand:        firstNonEmpty(r.brand, dump && dump.brand),
     color:        toStrList(r.colors || r.COLOR || r.color || (dump && (dump.colors || dump.COLOR || dump.color))).join(', '),
@@ -1849,6 +1859,7 @@ function renderGrid() {
       ${priorBadge}
       <div class="card-header">
         <div class="card-title">${escapeHtml(p.title)}</div>
+        ${p.url ? `<a class="card-url-link" href="${escapeHtml(productUrlHref(p.url))}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" title="View on ulta.com">↗</a>` : ''}
       </div>
       <div class="card-image-wrap">
         <img src="${p.image_url}" alt="${escapeHtml(p.title)}" loading="lazy" onerror="this.style.display='none'">
@@ -2207,6 +2218,17 @@ function openModal(pid, opts = {}) {
   document.getElementById('modalTitle').textContent = p.title || pid;
   document.getElementById('modalPid').textContent = pid;
   document.getElementById('modalImage').src = p.image_url || '';
+
+  const urlLink = document.getElementById('modalUrlLink');
+  if (urlLink) {
+    if (p.url) {
+      urlLink.href = productUrlHref(p.url);
+      urlLink.style.display = '';
+    } else {
+      urlLink.removeAttribute('href');
+      urlLink.style.display = 'none';
+    }
+  }
 
   // Thumbnails
   const thumbs = document.getElementById('modalThumbnails');

@@ -707,9 +707,14 @@ body {
   padding: 8px 34px 8px 10px;
   background: var(--bg-card);
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
 }
 
 .card-header .card-title {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   font-weight: 600;
   line-height: 1.3;
@@ -720,6 +725,37 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: normal;
+}
+
+/* ── Link-out icon (card + modal): jumps to the live product page ── */
+.card-url-link {
+  flex: 0 0 auto;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 2px 5px;
+  border-radius: var(--radius-sm);
+  transition: var(--transition);
+}
+
+.card-url-link:hover {
+  color: var(--accent);
+  background: var(--bg-card-hover);
+}
+
+.modal-url-link {
+  display: inline-block;
+  margin: 2px 0 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.modal-url-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
 }
 
 .card-body {

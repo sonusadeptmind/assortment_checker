@@ -110,7 +110,7 @@ def _build_index_entry(pid: str, doc: dict, cfg: dict[str, Any]) -> dict[str, An
     dump = doc.get("product_dump") if isinstance(doc.get("product_dump"), dict) else {}
     images = _extract_images(doc, dump)
 
-    entry: dict[str, Any] = {"product_id": pid}
+    entry: dict[str, Any] = {"product_id": pid, "url": doc.get("url") or dump.get("url") or ""}
 
     for index_key, source_keys in DEFAULT_INDEX_FIELDS.items():
         raw = next((doc.get(k) for k in source_keys if doc.get(k) not in (None, "", [])), None)
